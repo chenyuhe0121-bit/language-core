@@ -126,6 +126,7 @@ class WorkingTurn:
     created_at: str = ""
     spoken: bool = True
     seg_count: int = 1
+    context_content: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"role": self.role, "content": self.content,
@@ -227,6 +228,7 @@ class MemoryStore:
             "message": {
                 "spoken": "INTEGER NOT NULL DEFAULT 1",
                 "seg_count": "INTEGER NOT NULL DEFAULT 1",
+                "context_content": "TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, columns in wanted.items():
@@ -264,14 +266,14 @@ class MemoryStore:
 
     def add_message(self, user_id: str, character_id: str, role: str, content: str,
                     scene_id: str | None = None, spoken: bool = True,
-                    seg_count: int = 1) -> str:
+                    seg_count: int = 1, context_content: str = "") -> str:
         mid = f"m_{uuid.uuid4().hex[:12]}"
         with self._lock:
             self._conn.execute(
-                "INSERT INTO message(id, user_id, character_id, scene_id, role, content, spoken, seg_count, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO message(id, user_id, character_id, scene_id, role, content, spoken, seg_count, created_at, context_content) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (mid, user_id, character_id, scene_id, role, content,
-                 1 if spoken else 0, int(seg_count), _now()),
+                 1 if spoken else 0, int(seg_count), _now(), context_content),
             )
             self._conn.commit()
         return mid
@@ -305,12 +307,12 @@ class MemoryStore:
     def recent_turns(self, user_id: str, character_id: str, limit: int) -> list[WorkingTurn]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT role, content, scene_id, spoken, seg_count, created_at FROM message "
+                "SELECT role, content, scene_id, spoken, seg_count, created_at, context_content FROM message "
                 "WHERE user_id=? AND character_id=? ORDER BY rowid DESC LIMIT ?",
                 (user_id, character_id, limit),
             ).fetchall()
         return [WorkingTurn(r["role"], r["content"], r["scene_id"], r["created_at"],
-                            bool(r["spoken"]), int(r["seg_count"] or 1))
+                            bool(r["spoken"]), int(r["seg_count"] or 1), r["context_content"])
                 for r in reversed(rows)]
 
     def message_count(self, user_id: str, character_id: str) -> int:
@@ -828,6 +830,7 @@ class MemoryWriter:
         with self._cv:
             self._stop = True
             self._cv.notify_all()
+        self._thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------- 自检
@@ -857,3 +860,75 @@ if __name__ == "__main__":  # pragma: no cover
     writer.shutdown()
     store._conn.close()
     os.remove(db)
+
+class ConversationStore(MemoryStore):
+    """工作台会话与质量反馈。SQLite 仍只在此模块使用。"""
+    def __init__(self, db_path=None):
+        super().__init__(db_path)
+        self._conn.executescript('''
+            CREATE TABLE IF NOT EXISTS conversation (
+                id TEXT PRIMARY KEY, owner TEXT NOT NULL, character_id TEXT NOT NULL,
+                scene_id TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                intimacy INTEGER NOT NULL DEFAULT 0, use_memory INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS reply_record (
+                turn_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                user_text TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS feedback (
+                turn_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                rating INTEGER NOT NULL, note TEXT NOT NULL, updated_at TEXT NOT NULL);
+        ''')
+        self._conn.commit()
+
+    def create_conversation(self, owner, character_id, scene_id, intimacy=0):
+        cid = 'chat_' + uuid.uuid4().hex
+        with self._lock:
+            self._conn.execute('INSERT INTO conversation VALUES(?,?,?,?,?,?,?,?)',
+                (cid, owner, character_id, scene_id, '新对话', _now(), intimacy, 0))
+            self._conn.commit()
+        self.set_profile(cid, character_id, 'intimacy', str(intimacy))
+        self.set_profile(cid, character_id, 'current_scene', scene_id)
+        return self.conversation(owner, cid)
+
+    def conversation(self, owner, cid):
+        with self._lock:
+            row = self._conn.execute('SELECT * FROM conversation WHERE id=? AND owner=?', (cid, owner)).fetchone()
+        if row is None: raise ValueError('会话不存在')
+        return dict(row)
+
+    def conversations(self, owner):
+        with self._lock:
+            return [dict(r) for r in self._conn.execute('SELECT * FROM conversation WHERE owner=? ORDER BY rowid DESC', (owner,)).fetchall()]
+
+    def configure_conversation(self, owner, cid, scene_id, intimacy, use_memory):
+        convo = self.conversation(owner, cid)
+        with self._lock:
+            self._conn.execute('UPDATE conversation SET scene_id=?,intimacy=?,use_memory=? WHERE id=? AND owner=?',
+                               (scene_id, intimacy, int(use_memory), cid, owner))
+            self._conn.commit()
+        self.set_profile(cid, convo['character_id'], 'current_scene', scene_id)
+        self.set_profile(cid, convo['character_id'], 'intimacy', str(intimacy))
+        return self.conversation(owner, cid)
+
+    def save_reply(self, cid, user_text, payload):
+        with self._lock:
+            self._conn.execute('INSERT INTO reply_record VALUES(?,?,?,?,?)',
+                (payload['reply']['turn_id'], cid, user_text, json.dumps(payload, ensure_ascii=False), _now()))
+            self._conn.execute("UPDATE conversation SET title=? WHERE id=? AND title='新对话'", (user_text[:24], cid))
+            self._conn.commit()
+
+    def replies(self, owner, cid):
+        self.conversation(owner, cid)
+        with self._lock:
+            rows = self._conn.execute('SELECT r.*,f.rating,f.note FROM reply_record r LEFT JOIN feedback f ON r.turn_id=f.turn_id WHERE r.conversation_id=? ORDER BY r.rowid', (cid,)).fetchall()
+        return [{'user_text': r['user_text'], 'payload': json.loads(r['payload']),
+                 'feedback': {'rating': r['rating'], 'note': r['note']}} for r in rows]
+
+    def save_feedback(self, owner, cid, turn_id, rating, note):
+        self.conversation(owner, cid)
+        if rating not in (-1, 1): raise ValueError('评分必须为喜欢或不喜欢')
+        with self._lock:
+            if not self._conn.execute('SELECT 1 FROM reply_record WHERE turn_id=? AND conversation_id=?', (turn_id, cid)).fetchone():
+                raise ValueError('回复不存在')
+            self._conn.execute('INSERT INTO feedback VALUES(?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET rating=excluded.rating,note=excluded.note,updated_at=excluded.updated_at',
+                               (turn_id, cid, rating, note[:2000], _now()))
+            self._conn.commit()

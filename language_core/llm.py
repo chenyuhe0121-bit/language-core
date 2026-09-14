@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -339,7 +340,8 @@ class MockLLM:
 
     def generate(self, *, system: str, user_message: str, params: dict[str, Any],
                  context: dict[str, Any], recall: RecallResult | None = None,
-                 attempt: int = 0) -> LLMResult:
+                 attempt: int = 0, messages: list[dict[str, str]] | None = None,
+                 on_delta: Any = None) -> LLMResult:
         msg = (user_message or "").strip()
         scene_id = context.get("scene", "cafe")
         stage_id = context.get("stage", "first_meet")
@@ -695,11 +697,12 @@ class OpenAICompatLLM:
 
     def generate(self, *, system: str, user_message: str, params: dict[str, Any],
                  context: dict[str, Any], recall: RecallResult | None = None,
-                 attempt: int = 0) -> LLMResult:
+                 attempt: int = 0, messages: list[dict[str, str]] | None = None,
+                 on_delta: Any = None) -> LLMResult:
         _ = context, recall
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [
+            "messages": messages or [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_message},
             ],
@@ -708,11 +711,16 @@ class OpenAICompatLLM:
             "frequency_penalty": params.get("frequency_penalty", 0.0),
             "presence_penalty": params.get("presence_penalty", 0.0),
             "max_tokens": params.get("max_tokens", 800),
-            "stream": False,
+            "stream": on_delta is not None,
         }
         if attempt > 0:
             # 重生成时略降温度，提高格式稳定性
             payload["temperature"] = round(max(0.3, payload["temperature"] - 0.2), 2)
+
+        # DeepSeek's current default includes reasoning. Voice turns need immediate
+        # spoken content; other OpenAI-compatible providers keep their own defaults.
+        if urllib.parse.urlparse(self.base_url).hostname == 'api.deepseek.com':
+            payload['thinking'] = {'type': 'disabled'}
 
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -726,6 +734,27 @@ class OpenAICompatLLM:
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                if on_delta is not None:
+                    pieces = []
+                    finish = None
+                    for line in resp:
+                        line = line.decode('utf-8').strip()
+                        if not line.startswith('data:'): continue
+                        value = line[5:].strip()
+                        if value == '[DONE]': break
+                        event = json.loads(value)
+                        if event.get('error'): raise RuntimeError('模型流返回错误')
+                        choices = event.get('choices') or []
+                        if not choices: continue
+                        choice = choices[0]
+                        finish = choice.get('finish_reason') or finish
+                        delta = choice.get('delta', {}).get('content') or ''
+                        if delta:
+                            pieces.append(delta)
+                            on_delta(delta)
+                    if not finish: raise RuntimeError('模型流提前断开，请重试')
+                    if finish == 'length': raise RuntimeError('模型输出超出长度限制，请重试')
+                    return LLMResult(text=''.join(pieces), model=self.model, mode='live')
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             detail = ""

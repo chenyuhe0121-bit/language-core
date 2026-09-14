@@ -22,7 +22,8 @@ LLM_MODEL = os.environ.get("LANGUAGE_CORE_LLM_MODEL", "deepseek-chat")
 LLM_TIMEOUT = int(os.environ.get("LANGUAGE_CORE_LLM_TIMEOUT", "60"))
 
 # 按场景/阶段的参数映射（技术栈 D6：参数不全局一套）
-PARAMS_DEFAULT = {"temperature": 0.9, "top_p": 1.0, "frequency_penalty": 0.3, "presence_penalty": 0.3, "max_tokens": 800}
+PARAMS_DEFAULT = {"temperature": 0.9, "top_p": 1.0, "frequency_penalty": 0.15, "presence_penalty": 0.0, "max_tokens": 1200}
+MAX_CONTEXT_CHARS = 48000
 PARAMS_BY_INTENT = {
     "comfort":   {"temperature": 0.7},
     "reminisce": {"temperature": 0.8},
@@ -44,13 +45,13 @@ BUDGET = {
     "scene": 500,       # 场景卡
     "memory": 600,      # 召回记忆
     "summary": 300,     # 滚动摘要
-    "recent": 1200,     # 最近对话
+    "recent": 24000,    # 完整旧消息移除，角色卡不裁剪
 }
 # 超预算时的降级顺序：先砍靠后的
 DEGRADE_ORDER = ["recent", "memory", "summary", "scene", "state"]
 
 # ---- 记忆 ----
-RECENT_TURNS = 8          # 工作记忆保留的对话轮数
+RECENT_TURNS = 60         # 消息数，约 30 轮
 SUMMARY_EVERY = 10        # 每多少条消息触发一次摘要压缩
 RECALL_LIMIT = 5          # 单次召回条数上限
 RECALL_MIN_SCORE = 0.18   # 召回最低分，宁可不召回不污染上下文

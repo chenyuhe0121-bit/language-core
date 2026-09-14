@@ -1,340 +1,56 @@
 'use strict';
-
-const USER_ID = 'local';
-
-const el = (id) => document.getElementById(id);
-
-let STATE = null;
-let SCENES = [];
-
-async function api(path, options) {
-  const res = await fetch(path, options);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { data });
-  return data;
-}
-
-/* ---------------- 状态与侧栏 ---------------- */
-
-async function loadState() {
-  STATE = await api(`/api/state?user_id=${USER_ID}`);
-  el('s-scene').textContent = STATE.scene.name;
-  el('s-stage').textContent = STATE.stage.name;
-  el('s-intimacy').textContent = STATE.intimacy;
-  el('s-mode').textContent = STATE.mode === 'live' ? STATE.model : 'mock（离线）';
-  el('h-scene').textContent = `${STATE.character.name} · ${STATE.scene.name}`;
-  el('h-goal').textContent = STATE.scene.goal || '';
-  renderScenes();
-  await loadMemory();
-}
-
-function renderScenes() {
-  const box = el('scene-list');
-  box.innerHTML = '';
-  SCENES.forEach((s) => {
-    const unlocked = STATE.unlocked_scenes.includes(s.id);
-    const active = STATE.scene.id === s.id;
-    const div = document.createElement('div');
-    div.className = 'scene-item' + (active ? ' active' : '') + (unlocked ? '' : ' locked');
-    div.innerHTML = `<span>${s.name}</span><span class="meta">${unlocked ? (active ? '当前' : '可进入') : '未解锁'}</span>`;
-    if (unlocked && !active) div.onclick = () => switchScene(s.id);
-    box.appendChild(div);
-  });
-}
-
-async function switchScene(sceneId) {
-  try {
-    const res = await api('/api/scene', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: USER_ID, scene_id: sceneId }),
-    });
-    STATE = res.state;
-    el('s-scene').textContent = STATE.scene.name;
-    el('h-scene').textContent = `${STATE.character.name} · ${STATE.scene.name}`;
-    el('h-goal').textContent = STATE.scene.goal || '';
-    renderScenes();
-    addSystemNote(`转到「${STATE.scene.name}」——关系状态不变，她不会退回生疏。`);
-  } catch (e) {
-    addSystemNote(e.message);
-  }
-}
-
-async function loadMemory() {
-  const data = await api(`/api/memory?user_id=${USER_ID}`);
-
-  const box = el('memory-list');
-  box.innerHTML = '';
-  if (!data.memories.length) {
-    box.innerHTML = '<div class="memory-empty">还没有记住任何事。聊几句试试。</div>';
-  }
-  data.memories.forEach((m) => {
-    const div = document.createElement('div');
-    div.className = 'memory-item';
-    div.innerHTML = `
-      <div>${escapeHtml(m.content)}</div>
-      <div class="meta">
-        <span class="mtype">${m.type} · 置信 ${m.confidence}</span>
-        <span>
-          <button class="mini link" data-edit="${m.id}">改</button>
-          <button class="mini link" data-del="${m.id}">删</button>
-        </span>
-      </div>`;
-    box.appendChild(div);
-  });
-
-  box.querySelectorAll('[data-del]').forEach((b) => {
-    b.onclick = async () => {
-      await api('/api/memory/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ memory_id: b.dataset.del }),
-      });
-      addSystemNote('已删除这条记忆。她后续不会再提起它。');
-      loadMemory();
-    };
-  });
-
-  box.querySelectorAll('[data-edit]').forEach((b) => {
-    b.onclick = async () => {
-      const current = b.closest('.memory-item').firstElementChild.textContent;
-      const next = prompt('修改这条记忆（她会按新内容记）：', current);
-      if (next === null) return;
-      await api('/api/memory/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ memory_id: b.dataset.edit, content: next }),
-      });
-      loadMemory();
-    };
-  });
-
-  const loops = el('loop-list');
-  loops.innerHTML = '';
-  if (!data.open_loops.length) {
-    loops.innerHTML = '<div class="memory-empty">没有未结的事。</div>';
-  }
-  data.open_loops.forEach((l) => {
-    const div = document.createElement('div');
-    div.className = 'memory-item';
-    div.innerHTML = `<div>${escapeHtml(l.topic)}</div>
-      <div class="meta"><span class="mtype">${l.status}</span><span>${l.created_scene || ''}</span></div>`;
-    loops.appendChild(div);
-  });
-}
-
-/* ---------------- 对话渲染 ---------------- */
-
-function addSystemNote(text) {
-  const div = document.createElement('div');
-  div.className = 'system-note';
-  div.textContent = text;
-  el('messages').appendChild(div);
-  scrollBottom();
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ));
-}
-
-function renderTurn(reply) {
-  const wrap = document.createElement('div');
-  wrap.className = 'turn assistant';
-
-  reply.segments.forEach((seg) => {
-    const d = document.createElement('div');
-
-    if (seg.type === 'inner_thought') {
-      d.className = 'seg seg-thought';
-      d.textContent = `（${seg.text || ''}）`;
-      wrap.appendChild(d);
-      return;
-    }
-
-    if (!seg.spoken) {
-      d.className = 'seg seg-narration';
-      d.textContent = `（${seg.text || ''}）`;
-      wrap.appendChild(d);
-      return;
-    }
-
-    d.className = 'seg';
-    const bubble = document.createElement('div');
-    bubble.className = 'seg-dialogue';
-    bubble.textContent = seg.text || '';
-    d.appendChild(bubble);
-
-    const n = seg.narration;
-    if (n) {
-      const tags = document.createElement('div');
-      tags.className = 'seg-tags';
-      (n.emotion || []).forEach((e) => {
-        tags.innerHTML += `<span class="tag mood">情绪 ${e.name} ${e.intensity}</span>`;
-      });
-      if (n.pace) tags.innerHTML += `<span class="tag">语速 ${n.pace}</span>`;
-      if (n.intent) tags.innerHTML += `<span class="tag">意图 ${n.intent}</span>`;
-      (n.expression || []).forEach((x) => {
-        tags.innerHTML += `<span class="tag expr">表情 ${x}</span>`;
-      });
-      if (tags.children.length) d.appendChild(tags);
-    }
-    wrap.appendChild(d);
-  });
-
-  el('messages').appendChild(wrap);
-  scrollBottom();
-}
-
-function renderUser(text) {
-  const wrap = document.createElement('div');
-  wrap.className = 'turn user';
-  wrap.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
-  el('messages').appendChild(wrap);
-  scrollBottom();
-}
-
-function scrollBottom() {
-  const m = el('messages');
-  m.scrollTop = m.scrollHeight;
-}
-
-/* ---------------- 调试面板 ---------------- */
-
-function renderDebug(payload) {
-  const d = payload.debug || {};
-  const c = d.context || {};
-  const b = d.budget || {};
-  const checks = d.checks || {};
-
-  const recalled = (c.recalled_memory_preview || []);
-  const loops = c.open_loops || [];
-  const failed = checks.failed || [];
-
-  el('debug-body').innerHTML = `
-    <h4>参数</h4>
-    <pre>${escapeHtml(JSON.stringify(d.params || {}, null, 1))}</pre>
-
-    <h4>上下文预算（字符）</h4>
-    <pre>${escapeHtml(Object.entries(b.used || {}).map(([k, v]) => `${k}: ${v} / ${(b.budget || {})[k] ?? '-'}`).join('\n'))}</pre>
-    ${(b.trimmed || []).length ? `<div class="bad">裁剪: ${b.trimmed.join(', ')}</div>` : ''}
-
-    <h4>召回的记忆</h4>
-    ${recalled.length ? `<ul>${recalled.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : '<div>（无）</div>'}
-
-    <h4>未闭合话题</h4>
-    ${loops.length ? `<ul>${loops.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : '<div>（无）</div>'}
-
-    <h4>本场景可用表情</h4>
-    <div>${(c.allowed_expressions || []).map(escapeHtml).join('、')}</div>
-
-    <h4>校验</h4>
-    <div class="${checks.passed ? 'ok' : 'bad'}">${checks.passed ? '全部通过' : '有未通过项'}</div>
-    ${failed.length ? `<ul>${failed.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : ''}
-    <pre>${escapeHtml(JSON.stringify(checks.metrics || {}, null, 1))}</pre>
-
-    <h4>解析</h4>
-    <div>状态 ${c.parse_status || (checks.metrics || {}).parse_status || '-'}，重生成 ${d.regenerated || 0} 次</div>
-    ${d.error ? `<div class="bad">模型错误：${escapeHtml(d.error)}（已降级）</div>` : ''}
-  `;
-}
-
-/* ---------------- 发送 ---------------- */
-
-async function send() {
-  const input = el('input');
-  const text = input.value.trim();
-  if (!text) return;
-
-  input.value = '';
-  input.style.height = 'auto';
-  el('btn-send').disabled = true;
-
-  renderUser(text);
-
-  try {
-    const payload = await api('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: USER_ID, message: text }),
-    });
-    renderTurn(payload.reply);
-    renderDebug(payload);
-    el('s-scene').textContent = STATE.scene.name;
-    await loadState();
-  } catch (e) {
-    addSystemNote('出错：' + e.message);
-  } finally {
-    el('btn-send').disabled = false;
-    input.focus();
-  }
-}
-
-/* ---------------- 事件 ---------------- */
-
-el('btn-send').onclick = send;
-el('input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    send();
-  }
-});
-el('input').addEventListener('input', () => {
-  const t = el('input');
-  t.style.height = 'auto';
-  t.style.height = Math.min(t.scrollHeight, 140) + 'px';
-});
-el('btn-debug').onclick = () => el('debug').classList.toggle('hidden');
-el('btn-memory-refresh').onclick = loadMemory;
-el('btn-export').onclick = async () => {
-  const data = await api(`/api/export?user_id=${USER_ID}`);
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'language-core-export.json';
-  a.click();
-};
-el('btn-wipe').onclick = async () => {
-  if (!confirm('删除该角色下全部记忆与对话，不可恢复。继续？')) return;
-  await api('/api/delete_all', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_id: USER_ID }),
-  });
-  el('messages').innerHTML = '';
-  addSystemNote('已清空。她从零开始认识你。');
-  await loadState();
-};
-
-/* ---------------- 启动 ---------------- */
-
-(async function boot() {
-  const health = await api('/api/health');
-  if (!health.assets.ok) {
-    addSystemNote('资产校验未通过：' + (health.assets.errors || []).join('; '));
-  }
-  SCENES = (await api('/api/scenes')).scenes;
-  await loadState();
-
-  const recent = STATE.recent || [];
-  if (!recent.length) {
-    addSystemNote('新会话。尝试告诉她你的名字，或说说今天过得怎么样。');
-  } else {
-    recent.forEach((t) => {
-      if (t.role === 'user') renderUser(t.content);
-      else {
-        const wrap = document.createElement('div');
-        wrap.className = 'turn assistant';
-        const d = document.createElement('div');
-        d.className = 'seg';
-        d.innerHTML = `<div class="seg-dialogue">${escapeHtml(t.content)}</div>`;
-        wrap.appendChild(d);
-        el('messages').appendChild(wrap);
-      }
-    });
-    scrollBottom();
-    addSystemNote('以上是上次的对话记录。她记得这些。');
-  }
-  el('input').focus();
-})();
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let importedScenario='',requestId=null;
+let characters=[],scenes=[],sessions=[],state=null,current=null,busy=false,controller=null,voice=false,feedbackTurn=null,lastDebug=null;
+const moods={neutral:'平静',happy:'开心',concern:'关切',sad:'难过',playful:'俏皮',shy:'害羞',annoyed:'不悦',surprised:'惊讶'};
+const paces={slow:'慢',normal:'自然',fast:'快',very_slow:'很慢',very_fast:'很快'};
+async function api(path,body){const res=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await res.json();if(!res.ok)throw Error(data.error||'请求失败');return data;}
+function qs(){return '?session_id='+encodeURIComponent(current);}
+function notice(text,error=false){$('notice').textContent=text;$('notice').classList.toggle('error',error);}
+function scroll(){const box=$('messages');box.scrollTop=box.scrollHeight;}
+function setBusy(value){busy=value;for(const id of ['send','scene','relationship','new-chat','add-character','memory-enabled'])$(id).disabled=value;$('stop').classList.toggle('hidden',!value);$('generation-status').textContent=value?'正在组织回应…':'台词与情绪同步生成';renderCharacters();renderSessions();}
+function avatar(node,card){node.textContent=card.name.slice(0,1);node.style.setProperty('--avatar',/^#[0-9a-f]{6}$/i.test(card.color)?card.color:'#547867');}
+function renderCharacters(){const box=$('characters');box.replaceChildren();characters.forEach(card=>{const b=document.createElement('button');b.className='character-card'+(state?.character.id===card.id?' active':'');b.disabled=busy;b.innerHTML=`<span class="avatar"></span><span><b>${esc(card.name)}</b><small>${esc(card.tagline)}</small></span>`;avatar(b.firstElementChild,card);b.onclick=()=>guard(async()=>{const prior=sessions.find(s=>s.character_id===card.id);if(prior)await openSession(prior.id);else await newChat(card.id);});box.append(b);});}
+function renderSessions(){const box=$('sessions');box.replaceChildren();sessions.forEach(s=>{const card=characters.find(c=>c.id===s.character_id);const b=document.createElement('button');b.className='session'+(s.id===current?' active':'');b.disabled=busy;b.innerHTML=`${esc(s.title)}<small>${esc(card?.name||s.character_id)} · ${esc(s.created_at.slice(5,10))}</small>`;b.onclick=()=>guard(()=>openSession(s.id));box.append(b);});}
+async function refreshSessions(){sessions=(await api('/api/sessions')).sessions;renderSessions();}
+function renderState(){const c=state.character;$('character-name').textContent=c.name;$('character-tagline').textContent=c.tagline;avatar($('header-avatar'),c);$('scene').value=state.scene.id;$('relationship').value=String([0,10,20,30,40].filter(v=>v<=state.intimacy).pop()||0);$('memory-enabled').checked=!!state.session?.use_memory;$('model-status').textContent=state.mode==='live'?state.model:'离线演示 · 非真实对话';renderCharacters();renderSessions();}
+async function openSession(id){if(busy)return;current=id;localStorage.setItem('muse-session',id);state=await api('/api/state'+qs());renderState();$('messages').replaceChildren();lastDebug=null;$('debug').innerHTML='<p class="muted">选择一条回复的“详情”，或发一条新消息。</p>';
+ if(state.records.length){state.records.forEach(record=>{userTurn(record.user_text);const wrap=assistantTurn();record.payload.reply.segments.forEach(s=>appendSegment(wrap,s));finishTurn(wrap,record.payload,record.feedback);});}
+ else{const welcome=document.createElement('div');welcome.className='welcome';welcome.innerHTML=`<div class="avatar"></div><h2>和 ${esc(state.character.name)} 聊一会儿</h2><p>${esc(state.character.tagline)}。从此刻想到的一件小事开始。</p>`;avatar(welcome.firstElementChild,state.character);$('messages').append(welcome);if(state.character.greeting){const w=assistantTurn();appendSegment(w,{spoken:true,text:state.character.greeting});}}
+ notice(state.mode==='mock'?'当前是离线管道演示，不能用来评判角色质量。':'');$('sidebar').classList.remove('open');await loadMemory();scroll();$('input').focus();}
+async function newChat(characterId=state?.character.id||'elise'){if(busy)return;const {session}=await api('/api/sessions',{character_id:characterId,scene_id:$('scene').value||'cafe'});await refreshSessions();await openSession(session.id);}
+function userTurn(text){const w=document.createElement('div');w.className='turn user';w.innerHTML=`<div class="speaker">你</div><div class="bubble">${esc(text)}</div>`;$('messages').append(w);scroll();return w;}
+function assistantTurn(){const w=document.createElement('div');w.className='turn assistant';w.innerHTML=`<div class="speaker">${esc(state.character.name)}</div>`;$('messages').append(w);return w;}
+function appendSegment(w,s){const d=document.createElement('div');d.className=s.spoken?'bubble':'narration';d.textContent=s.text||'';if(s.narration?.emotion?.length)d.title=s.narration.emotion.map(e=>`${moods[e.name]||e.name} ${e.intensity}`).join(' · ');w.append(d);scroll();}
+function speak(s){if(!voice||!s.spoken||!s.text||!('speechSynthesis'in window))return;const u=new SpeechSynthesisUtterance(s.text);u.lang='zh-CN';u.rate={slow:.85,fast:1.15}[s.narration?.pace]||1;u.onstart=()=>{$('generation-status').textContent='试听 · '+(s.narration?.emotion||[]).map(e=>moods[e.name]||e.name).join(' / ');};u.onend=()=>{if(!speechSynthesis.pending&&!busy)$('generation-status').textContent='台词与情绪同步生成';};speechSynthesis.speak(u);}
+function finishTurn(w,payload,feedback={}){const d=payload.debug||{};const actions=document.createElement('div');actions.className='turn-actions';actions.innerHTML=`<button data-like class="${feedback?.rating===1?'selected':''}">喜欢</button><button data-dislike class="${feedback?.rating===-1?'selected':''}">不合适</button><button data-detail>详情</button><button data-play>朗读</button><span class="timing">${d.first_segment_ms!=null?'首段 '+(d.first_segment_ms/1000).toFixed(1)+'s':(d.latency_ms/1000).toFixed(1)+'s'}</span>`;actions.querySelector('[data-like]').onclick=()=>guard(async()=>{await api('/api/feedback',{session_id:current,turn_id:payload.reply.turn_id,rating:1});actions.querySelector('[data-like]').classList.add('selected');actions.querySelector('[data-dislike]').classList.remove('selected');notice('已保存这条回复的反馈。');});actions.querySelector('[data-dislike]').onclick=()=>{feedbackTurn={id:payload.reply.turn_id,actions};$('feedback-note').value=feedback?.note||'';$('feedback-dialog').showModal();};actions.querySelector('[data-detail]').onclick=()=>{debug(payload);$('inspector').classList.remove('hidden');};actions.querySelector('[data-play]').onclick=()=>{if(!('speechSynthesis'in window)){notice('当前浏览器不支持试听。',true);return;}speechSynthesis.cancel();const previous=voice;voice=true;payload.reply.segments.forEach(speak);voice=previous;notice('浏览器声音试听，尚未接入产品 TTS 与视频形象。');};w.append(actions);}
+function debug(payload){lastDebug=payload;const d=payload.debug||{};const checks=d.checks||{};$('debug').innerHTML=`<h3>本轮表达</h3>${payload.reply.segments.map(s=>`<p>${esc(s.text)}</p><div>${(s.narration?.emotion||[]).map(e=>`<span class="badge">${esc(moods[e.name]||e.name)} ${e.intensity}</span>`).join('')}<span class="badge">${esc(paces[s.narration?.pace]||'自然')}</span>${(s.narration?.expression||[]).map(e=>`<span class="badge">${esc(e)}</span>`).join('')}</div>`).join('')}<h3>生成信息</h3><pre>${esc(JSON.stringify({model:payload.reply.meta?.model,prompt:d.context?.prompt_version,first_segment_ms:d.first_segment_ms,total_ms:d.latency_ms,history_messages:d.context?.recent_count,mode:d.mode,regenerated:d.regenerated},null,2))}</pre><h3>协议检查</h3><p>${checks.hard_fail?'未通过':'可解析'}${checks.warnings?.length?' · 有风格提示':''}</p><p class="muted">协议通过不等于对话质量通过；自然度与人设以你的体验为准。</p><details><summary>实际发送给模型的消息</summary><pre>${esc(JSON.stringify(d.messages||[],null,2))}</pre></details><details><summary>上下文使用量</summary><pre>${esc(JSON.stringify(d.budget,null,2))}</pre></details><details><summary>完整输出协议</summary><pre>${esc(JSON.stringify(payload.reply,null,2))}</pre></details>`;}
+async function loadMemory(){const data=await api('/api/memory'+qs());$('memory').innerHTML=data.memories.map(m=>`<p class="muted">${esc(m.content)}</p>`).join('')||'<p class="muted">当前会话暂无长期记忆。</p>';}
+async function settings(){if(busy)return;const out=await api('/api/session/settings',{session_id:current,scene_id:$('scene').value,intimacy:Number($('relationship').value),use_memory:$('memory-enabled').checked});state=out.state;renderState();notice('已更新当前对话的场景与关系。');}
+async function send(event){event?.preventDefault();if(busy||!current)return;const text=$('input').value.trim();if(!text)return;const submittedSession=current;setBusy(true);notice('');$('input').value='';$('input').style.height='auto';userTurn(text);const w=assistantTurn();const typing=document.createElement('div');typing.className='typing';typing.textContent='正在想怎么接你的话…';w.append(typing);scroll();controller=new AbortController();requestId=crypto.randomUUID();let complete=false,segments=0;
+ try{const response=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:submittedSession,request_id:requestId,message:text}),signal:controller.signal});if(!response.ok){const e=await response.json();throw Error(e.error||'生成失败');}const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';
+ const processEvent=block=>{let name='message',data='';for(const line of block.split('\n')){if(line.startsWith('event:'))name=line.slice(6).trim();if(line.startsWith('data:'))data+=line.slice(5).trim();}if(!data)return;const p=JSON.parse(data);if(name==='segment'){typing.remove();appendSegment(w,p);speak(p);segments++;$('generation-status').textContent='正在回应…';}if(name==='error')throw Error(p.error);if(name==='done'){typing.remove();if(!segments)p.reply.segments.forEach(s=>appendSegment(w,s));finishTurn(w,p);debug(p);complete=true;}};
+ while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let pos;while((pos=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,pos);buffer=buffer.slice(pos+2);processEvent(block);}}
+ if(!complete)throw Error('连接中断，本轮未保存。');await refreshSessions();await loadMemory();
+ }catch(e){typing.remove();if('speechSynthesis'in window)speechSynthesis.cancel();w.remove();notice(e.name==='AbortError'?'已停止，本轮不计入对话历史。':'未完成：'+e.message+' 输入已保留，可重试。',e.name!=='AbortError');if(!$('input').value)$('input').value=text;}
+ finally{controller=null;setBusy(false);$('input').focus();scroll();}}
+async function guard(fn){try{await fn();}catch(e){notice(e.message,true);}}
+$('composer').onsubmit=send;
+$('input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send();}};
+$('input').oninput=()=>{$('input').style.height='auto';$('input').style.height=Math.min($('input').scrollHeight,170)+'px';};
+$('stop').onclick=()=>{if(!controller)return;api('/api/chat/cancel',{session_id:current,request_id:requestId}).finally(()=>controller?.abort());};
+$('new-chat').onclick=()=>guard(()=>newChat());
+$('scene').onchange=()=>guard(settings);$('relationship').onchange=()=>guard(settings);$('memory-enabled').onchange=()=>guard(settings);
+$('inspect').onclick=()=>{const open=$('inspector').classList.contains('hidden');$('inspector').classList.toggle('hidden');$('inspect').setAttribute('aria-expanded',String(open));};
+$('close-inspector').onclick=()=>{$('inspector').classList.add('hidden');$('inspect').setAttribute('aria-expanded','false');};
+$('menu').onclick=()=>$('sidebar').classList.toggle('open');
+$('voice').onclick=()=>{if(!('speechSynthesis'in window)){notice('当前浏览器不支持试听。',true);return;}voice=!voice;$('voice').textContent='试听：'+(voice?'开':'关');$('voice').setAttribute('aria-pressed',String(voice));if(!voice)speechSynthesis.cancel();notice(voice?'使用浏览器语音试听；音色与情绪不代表最终 TTS 效果。':'已关闭自动试听。');};
+$('add-character').onclick=()=>{$('card-form').reset();importedScenario='';$('card-error').textContent='';$('card-dialog').showModal();};
+$('close-card').onclick=()=>$('card-dialog').close();
+$('card-file').onchange=async()=>{try{const file=$('card-file').files[0];if(!file)return;if(file.size>200000)throw Error('文件过大，请使用小于 200KB 的 JSON 角色卡');const raw=JSON.parse(await file.text());const c=raw.data||raw;importedScenario=c.scenario||'';$('card-name').value=c.name||c.identity?.name||'';$('card-description').value=c.description||'';$('card-personality').value=c.personality||'';$('card-greeting').value=c.first_mes||c.greeting||'';$('card-examples').value=typeof(c.mes_example||c.examples)==='string'?(c.mes_example||c.examples):JSON.stringify(c.examples||[],null,2);$('card-error').textContent='已读取基础角色字段。卡片中的全局指令覆盖、世界书与 PNG 图片暂不导入。';}catch(e){$('card-error').textContent=e.message;}};
+$('card-form').onsubmit=async e=>{e.preventDefault();$('save-card').disabled=true;try{const raw=$('card-examples').value;let examples=raw;try{examples=JSON.parse(raw);}catch{}const out=await api('/api/characters',{card:{name:$('card-name').value,description:$('card-description').value,personality:$('card-personality').value,greeting:$('card-greeting').value,scenario:importedScenario,examples}});characters=(await api('/api/characters')).characters;$('card-dialog').close();await newChat(out.character.id);}catch(e){$('card-error').textContent=e.message;}finally{$('save-card').disabled=false;}};
+$('close-feedback').onclick=()=>$('feedback-dialog').close();
+$('feedback-form').onsubmit=e=>{e.preventDefault();guard(async()=>{await api('/api/feedback',{session_id:current,turn_id:feedbackTurn.id,rating:-1,note:$('feedback-note').value});feedbackTurn.actions.querySelector('[data-dislike]').classList.add('selected');feedbackTurn.actions.querySelector('[data-like]').classList.remove('selected');$('feedback-dialog').close();notice('已保存反馈，包含这轮的角色、提示词与回复。');});};
+$('export').onclick=()=>guard(async()=>{const data=await api('/api/export'+qs());const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='muse-conversation.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);});
+(async()=>{try{const health=await api('/api/health');if(health.version!=='0.2')throw Error('请重启服务以加载新版本');characters=(await api('/api/characters')).characters;scenes=(await api('/api/scenes')).scenes;$('scene').innerHTML=scenes.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');$('scene').value='cafe';await refreshSessions();const saved=localStorage.getItem('muse-session');if(sessions.some(s=>s.id===saved))await openSession(saved);else if(sessions.length)await openSession(sessions[0].id);else await newChat('elise');}catch(e){notice('连接失败：'+e.message,true);}})();

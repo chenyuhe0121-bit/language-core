@@ -1,279 +1,219 @@
-"""HTTP 服务。
-
-技术栈 D3：本层是唯一可替换的层。内核（segment / compiler / memory / llm）
-全部纯标准库，换 FastAPI 时只需重写本文件的路由。
-"""
-
+"""Local conversation studio HTTP API. SSE contains complete, validated speech segments."""
 from __future__ import annotations
-
 import json
 import mimetypes
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
-
 from . import config, persona
-from .engine import Engine, classify_intent
-from .persona import validate_assets
+from .cards import public_card, save_card
+from .engine import Engine
+from .memory import ConversationStore
 
-WEB_DIR = config.ROOT / "language_core" / "web"
-
+WEB_DIR = config.ROOT / 'language_core' / 'web'
 _engine_lock = threading.Lock()
-_engine: Engine | None = None
+_engine = None
+_chat_lock = threading.Lock()
+_active = {}
+_active_lock = threading.Lock()
 
-
-def engine() -> Engine:
+def engine():
     global _engine
     with _engine_lock:
-        if _engine is None:
-            _engine = Engine()
+        if _engine is None: _engine = Engine(store=ConversationStore())
         return _engine
 
-
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LanguageCore/0.1"
+    server_version = 'LanguageCore/0.2'
+    def log_message(self, fmt, *args):
+        print(f'[{self.log_date_time_string()}] {fmt % args}', flush=True)
 
-    # ---- 基础 ----
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        if config.MODE == "live" or True:
-            print(f"[{self.log_date_time_string()}] {fmt % args}")
-
-    def _send_json(self, payload: Any, status: int = 200) -> None:
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    def _send_json(self, payload, status=200):
+        raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(raw)
 
-    def _send_text(self, text: str, status: int = 200, ctype: str = "text/plain; charset=utf-8") -> None:
-        body = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def _body(self):
+        length = int(self.headers.get('Content-Length', '0'))
+        if length > 200000: raise ValueError('请求过大')
+        value = json.loads(self.rfile.read(length) or b'{}')
+        if not isinstance(value, dict): raise ValueError('请求必须为 JSON 对象')
+        return value
 
-    def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
-        raw = self.rfile.read(length).decode("utf-8")
+    def _identity(self, values):
+        owner = str(values.get('user_id') or 'local')
+        sid = str(values.get('session_id') or '')
+        if sid:
+            convo = engine().store.conversation(owner, sid)
+            return sid, convo['character_id'], convo
+        character = str(values.get('character_id') or config.DEFAULT_CHARACTER)
+        persona.load_character(character)
+        return owner, character, None
+
+    def _state(self, values):
+        uid, cid, convo = self._identity(values)
+        eng = engine()
+        profile = eng.store.get_profile(uid, cid)
+        scene = persona.load_scene(profile.get('current_scene', config.DEFAULT_SCENE))
+        rel = eng.relationship(uid, cid)
+        result = {'character': public_card(cid), 'scene': {'id': scene.id, 'name': scene.name, 'goal': scene.scene_goal.get('primary', '')},
+                  'stage': {'id': rel['stage'].id, 'name': rel['stage'].name}, 'intimacy': rel['intimacy'],
+                  'unlocked_scenes': list(persona.all_scene_ids()), 'mode': eng.llm.mode,
+                  'model': config.LLM_MODEL if eng.llm.mode == 'live' else 'mock',
+                  'recent': [x.to_dict() for x in eng.store.recent_turns(uid, cid, 60)],
+                  'session': convo, 'records': eng.store.replies(str(values.get('user_id') or 'local'), uid) if convo else []}
+        return result
+
+    def do_GET(self):
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
+            parsed = urllib.parse.urlparse(self.path)
+            route = parsed.path
+            values = {k: v[0] for k,v in urllib.parse.parse_qs(parsed.query).items()}
+            owner = str(values.get('user_id') or 'local')
+            if route in ('/', '/app.js', '/app.css'):
+                path = WEB_DIR / ('index.html' if route == '/' else route[1:])
+                raw = path.read_bytes()
+                self.send_response(200)
+                self.send_header('Content-Type', (mimetypes.guess_type(str(path))[0] or 'text/plain') + '; charset=utf-8')
+                self.send_header('Content-Length', str(len(raw)))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers(); self.wfile.write(raw)
+            elif route == '/api/health':
+                self._send_json({'ok': True, 'version': '0.2', 'mode': engine().llm.mode, 'model': config.LLM_MODEL, 'assets': persona.validate_assets().to_dict()})
+            elif route == '/api/characters':
+                self._send_json({'characters': [public_card(c) for c in persona.all_character_ids()]})
+            elif route == '/api/scenes':
+                self._send_json({'scenes': [{'id': s, 'name': persona.load_scene(s).name} for s in persona.all_scene_ids()]})
+            elif route == '/api/sessions':
+                self._send_json({'sessions': engine().store.conversations(owner)})
+            elif route == '/api/state': self._send_json(self._state(values))
+            elif route in ('/api/memory', '/api/export'):
+                uid,cid,convo = self._identity(values)
+                if route == '/api/export':
+                    payload = engine().store.export_user(uid,cid)
+                    if convo: payload['records'] = engine().store.replies(owner,uid)
+                    self._send_json(payload)
+                else:
+                    store=engine().store
+                    self._send_json({'memories':[m.to_dict() for m in store.all_memories(uid,cid)], 'summary':store.get_summary(uid,cid),
+                                     'open_loops':[l.to_dict() for l in store.open_loops(uid,cid)]})
+            else: self._send_json({'error':'接口不存在'},404)
+        except (ValueError, FileNotFoundError, KeyError) as e: self._send_json({'error':str(e)},400)
+        except (BrokenPipeError, ConnectionResetError): pass
+        except Exception: self._send_json({'error':'服务内部错误，请查看本地日志'},500); raise
 
-    def _static(self, rel: str) -> None:
-        path = (WEB_DIR / rel).resolve()
-        if not str(path).startswith(str(WEB_DIR.resolve())) or not path.is_file():
-            self._send_text("not found", 404)
-            return
-        ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in ("application/javascript",):
-            ctype += "; charset=utf-8"
-        self._send_text(path.read_text(encoding="utf-8"), 200, ctype)
+    def do_POST(self):
+        streaming = False
+        try:
+            # Local-only browser API, no cross-origin writes.
+            origin = self.headers.get('Origin')
+            if origin and urllib.parse.urlparse(origin).netloc != self.headers.get('Host'):
+                self._send_json({'error':'不接受跨站请求'},403); return
+            body = self._body()
+            route = urllib.parse.urlparse(self.path).path
+            owner = str(body.get('user_id') or 'local')
+            if route == '/api/characters':
+                card=save_card(body.get('card')); self._send_json({'character':public_card(card['id'])}); return
+            if route == '/api/sessions':
+                cid = str(body.get('character_id') or config.DEFAULT_CHARACTER)
+                scene = str(body.get('scene_id') or config.DEFAULT_SCENE)
+                persona.load_character(cid); persona.load_scene(scene)
+                convo=engine().store.create_conversation(owner,cid,scene)
+                greeting=persona.load_character(cid).raw.get('greeting','')
+                if greeting: engine().store.add_message(convo['id'],cid,'assistant',greeting,scene)
+                self._send_json({'session':convo}); return
+            uid,cid,convo = self._identity(body)
+            if route == '/api/chat/cancel':
+                with _active_lock:
+                    active = _active.get(uid)
+                    if active and active[0] == str(body.get('request_id') or ''):
+                        active[1].set()
+                self._send_json({'ok':True}); return
+            if route == '/api/feedback':
+                engine().store.save_feedback(owner,uid,str(body.get('turn_id')),int(body.get('rating',0)),str(body.get('note') or ''))
+                self._send_json({'ok':True}); return
+            if route in ('/api/scene','/api/session/settings'):
+                scene_id=str(body.get('scene_id') or (convo or {}).get('scene_id') or config.DEFAULT_SCENE)
+                persona.load_scene(scene_id)
+                intimacy=int(body.get('intimacy',(convo or {}).get('intimacy',0)))
+                if not 0 <= intimacy <= 100: raise ValueError('关系值超出范围')
+                if convo:
+                    engine().store.configure_conversation(owner,uid,scene_id,intimacy,bool(body.get('use_memory',convo['use_memory'])))
+                else: engine().store.set_profile(uid,cid,'current_scene',scene_id)
+                self._send_json({'ok':True,'state':self._state(body)}); return
+            if route in ('/api/chat','/api/chat/stream'):
+                message=str(body.get('message') or '').strip()
+                if not message or len(message)>6000: raise ValueError('消息须为 1–6000 字')
+                scene_id=str(body.get('scene_id') or (convo or {}).get('scene_id') or engine().store.get_profile(uid,cid).get('current_scene',config.DEFAULT_SCENE))
+                persona.load_scene(scene_id)
+                if not _chat_lock.acquire(blocking=False):
+                    self._send_json({'error':'正在生成另一条回复，请稍后重试'},409); return
+                cancel_event = threading.Event()
+                with _active_lock:
+                    _active[uid] = (str(body.get('request_id') or ''), cancel_event)
+                try:
+                    started=time.perf_counter(); first=None
+                    def emit(name,payload):
+                        raw=f'event: {name}\ndata: {json.dumps(payload,ensure_ascii=False)}\n\n'.encode('utf-8')
+                        self.wfile.write(raw); self.wfile.flush()
+                    if route.endswith('/stream'):
+                        self.send_response(200); self.send_header('Content-Type','text/event-stream; charset=utf-8')
+                        self.send_header('Cache-Control','no-cache'); self.send_header('Connection','close')
+                        self.end_headers(); self.close_connection=True; streaming=True
+                        emit('start',{'mode':engine().llm.mode})
+                    def segment(value):
+                        nonlocal first
+                        if first is None: first=time.perf_counter()-started
+                        emit('segment',value)
+                    result=engine().respond(user_id=uid,character_id=cid,scene_id=scene_id,message=message,
+                        use_memory=bool((convo or {}).get('use_memory',False)),on_segment=segment if streaming else None,cancelled=cancel_event.is_set)
+                    payload=result.to_dict()
+                    payload['debug']['mode']=engine().llm.mode
+                    payload['debug']['latency_ms']=round((time.perf_counter()-started)*1000)
+                    payload['debug']['first_segment_ms']=round(first*1000) if first is not None else None
+                    payload['debug']['messages']=result.context.messages()
+                    if convo: engine().store.save_reply(uid,message,payload)
+                    if streaming: emit('done',payload)
+                    else: self._send_json(payload)
+                except (BrokenPipeError,ConnectionResetError): pass
+                except Exception as e:
+                    if streaming: emit('error',{'error':str(e)})
+                    else: self._send_json({'error':str(e)},502)
+                finally:
+                    with _active_lock: _active.pop(uid,None)
+                    _chat_lock.release()
+                return
+            if route in ('/api/memory/delete','/api/memory/update'):
+                mid=str(body.get('memory_id') or '')
+                if mid not in {m.id for m in engine().store.all_memories(uid,cid)}: raise ValueError('记忆不存在')
+                if route.endswith('delete'): ok=engine().store.delete_memory(mid)
+                else:
+                    content=str(body.get('content') or '').strip()
+                    if not content: raise ValueError('记忆不能为空')
+                    ok=engine().store.update_memory(mid,content)
+                self._send_json({'ok':ok}); return
+            self._send_json({'error':'接口不存在'},404)
+        except (ValueError,FileNotFoundError,KeyError) as e:
+            if not streaming: self._send_json({'error':str(e)},400)
+        except (BrokenPipeError,ConnectionResetError): pass
+        except Exception:
+            if not streaming: self._send_json({'error':'服务内部错误，请查看本地日志'},500)
+            raise
 
-    # ---- 路由 ----
-
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urllib.parse.urlparse(self.path)
-        route = parsed.path.rstrip("/") or "/"
-        query = urllib.parse.parse_qs(parsed.query)
-
-        if route == "/":
-            self._static("index.html")
-        elif route == "/app.js":
-            self._static("app.js")
-        elif route == "/app.css":
-            self._static("app.css")
-        elif route == "/api/health":
-            self._send_json({
-                "ok": True,
-                "mode": config.MODE,
-                "model": config.LLM_MODEL if config.MODE == "live" else "mock",
-                "assets": validate_assets().to_dict(),
-            })
-        elif route == "/api/scenes":
-            self._send_json({"scenes": [
-                {
-                    "id": s,
-                    "name": persona.load_scene(s).name,
-                    "stage": persona.load_scene(s).stage_id,
-                    "goal": persona.load_scene(s).scene_goal,
-                }
-                for s in persona.all_scene_ids()
-            ]})
-        elif route == "/api/state":
-            user_id = (query.get("user_id") or ["local"])[0]
-            character_id = (query.get("character_id") or [config.DEFAULT_CHARACTER])[0]
-            self._send_json(self._state(user_id, character_id))
-        elif route == "/api/memory":
-            user_id = (query.get("user_id") or ["local"])[0]
-            character_id = (query.get("character_id") or [config.DEFAULT_CHARACTER])[0]
-            self._send_json(self._memory_view(user_id, character_id))
-        elif route == "/api/export":
-            user_id = (query.get("user_id") or ["local"])[0]
-            character_id = (query.get("character_id") or [config.DEFAULT_CHARACTER])[0]
-            self._send_json(engine().store.export_user(user_id, character_id))
-        else:
-            self._send_json({"error": "not found", "route": route}, 404)
-
-    def do_POST(self) -> None:  # noqa: N802
-        parsed = urllib.parse.urlparse(self.path)
-        route = parsed.path.rstrip("/")
-        body = self._read_json()
-
-        if route == "/api/chat":
-            self._chat(body)
-        elif route == "/api/scene":
-            self._switch_scene(body)
-        elif route == "/api/memory/delete":
-            self._delete_memory(body)
-        elif route == "/api/memory/update":
-            self._update_memory(body)
-        elif route == "/api/delete_all":
-            self._delete_all(body)
-        else:
-            self._send_json({"error": "not found", "route": route}, 404)
-
-    # ---- 业务 ----
-
-    def _ident(self, body: dict[str, Any]) -> tuple[str, str]:
-        return (
-            str(body.get("user_id") or "local"),
-            str(body.get("character_id") or config.DEFAULT_CHARACTER),
-        )
-
-    def _state(self, user_id: str, character_id: str) -> dict[str, Any]:
-        eng = engine()
-        rel = eng.relationship(user_id, character_id)
-        scene_id = eng.store.get_profile(user_id, character_id).get("current_scene", config.DEFAULT_SCENE)
-        scene = persona.load_scene(scene_id)
-        return {
-            "user_id": user_id,
-            "character": {"id": character_id, "name": persona.load_character(character_id).name},
-            "scene": {"id": scene.id, "name": scene.name, "stage": scene.stage_id, "goal": scene.scene_goal},
-            "stage": {
-                "id": rel["stage"].id,
-                "name": rel["stage"].name,
-                "intimacy_cap": rel["stage"].intensity_cap,
-                "body_language": rel["stage"].body_language,
-            },
-            "intimacy": rel["intimacy"],
-            "unlocked_scenes": rel["unlocked_scenes"],
-            "recent": [t.to_dict() for t in eng.store.recent_turns(user_id, character_id, 20)],
-            "mode": config.MODE,
-            "model": config.LLM_MODEL if config.MODE == "live" else "mock",
-        }
-
-    def _memory_view(self, user_id: str, character_id: str) -> dict[str, Any]:
-        eng = engine()
-        return {
-            "profile": eng.store.get_profile(user_id, character_id),
-            "memories": [m.to_dict() for m in eng.store.all_memories(user_id, character_id)],
-            "open_loops": [l.to_dict() for l in eng.store.open_loops(user_id, character_id, statuses=("pending", "ask_now", "asked"))],
-            "summary": eng.store.get_summary(user_id, character_id),
-        }
-
-    def _chat(self, body: dict[str, Any]) -> None:
-        user_id, character_id = self._ident(body)
-        message = str(body.get("message") or "").strip()
-        if not message:
-            self._send_json({"error": "message 为空"}, 400)
-            return
-
-        eng = engine()
-        profile = eng.store.get_profile(user_id, character_id)
-        scene_id = str(body.get("scene_id") or profile.get("current_scene") or config.DEFAULT_SCENE)
-
-        # 场景必须是已解锁的
-        rel = eng.relationship(user_id, character_id)
-        if scene_id not in rel["unlocked_scenes"]:
-            self._send_json({
-                "error": "场景未解锁",
-                "scene_id": scene_id,
-                "unlocked": rel["unlocked_scenes"],
-            }, 403)
-            return
-
-        result = eng.respond(
-            user_id=user_id, character_id=character_id,
-            scene_id=scene_id, message=message,
-        )
-        payload = result.to_dict()
-        payload["intent"] = classify_intent(message)
-        payload["state"] = {
-            "scene_id": scene_id,
-            "intimacy": rel["intimacy"],
-            "stage": rel["stage"].name,
-        }
-        self._send_json(payload)
-
-    def _switch_scene(self, body: dict[str, Any]) -> None:
-        user_id, character_id = self._ident(body)
-        scene_id = str(body.get("scene_id") or "")
-        eng = engine()
-        rel = eng.relationship(user_id, character_id)
-
-        if scene_id not in persona.all_scene_ids():
-            self._send_json({"error": f"未知场景 {scene_id}"}, 404)
-            return
-        if scene_id not in rel["unlocked_scenes"]:
-            self._send_json({"error": "场景未解锁", "unlocked": rel["unlocked_scenes"]}, 403)
-            return
-
-        eng.store.set_profile(user_id, character_id, "current_scene", scene_id)
-        self._send_json({"ok": True, "state": self._state(user_id, character_id)})
-
-    def _delete_memory(self, body: dict[str, Any]) -> None:
-        memory_id = str(body.get("memory_id") or "")
-        ok = engine().store.delete_memory(memory_id)
-        self._send_json({"ok": ok, "memory_id": memory_id})
-
-    def _update_memory(self, body: dict[str, Any]) -> None:
-        memory_id = str(body.get("memory_id") or "")
-        content = str(body.get("content") or "").strip()
-        if not content:
-            self._send_json({"error": "content 为空"}, 400)
-            return
-        ok = engine().store.update_memory(memory_id, content)
-        self._send_json({"ok": ok, "memory_id": memory_id})
-
-    def _delete_all(self, body: dict[str, Any]) -> None:
-        user_id, character_id = self._ident(body)
-        counts = engine().store.delete_user(user_id, character_id)
-        self._send_json({"ok": True, "deleted": counts})
-
-
-def serve() -> None:
-    print("=" * 56)
-    print("  Language Core · 陪伴产品语言系统内核")
-    print(f"  模式: {config.MODE}   模型: {config.LLM_MODEL if config.MODE == 'live' else 'mock(离线)'}")
-    print(f"  地址: http://{config.HOST}:{config.PORT}")
-    print("=" * 56)
-
-    report = validate_assets()
-    if not report.ok:
-        print("资产校验未通过:")
-        for e in report.errors:
-            print("  [错误]", e)
-    for w in report.warnings:
-        print("  [提示]", w)
-
-    httpd = ThreadingHTTPServer((config.HOST, config.PORT), Handler)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\n停止服务")
+def serve():
+    report=persona.validate_assets()
+    print(f'Language Core 0.2 | {config.MODE} | http://{config.HOST}:{config.PORT}',flush=True)
+    if not report.ok: print(report.to_dict(),flush=True)
+    httpd=ThreadingHTTPServer((config.HOST,config.PORT),Handler)
+    try: httpd.serve_forever()
+    except KeyboardInterrupt: pass
     finally:
         httpd.server_close()
-        if _engine is not None:
-            _engine.shutdown()
+        if _engine: _engine.shutdown()
 
-
-if __name__ == "__main__":
-    serve()
+if __name__=='__main__': serve()

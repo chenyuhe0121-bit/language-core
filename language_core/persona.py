@@ -30,49 +30,18 @@ from .segment import (
 
 
 STYLE_ANCHOR: dict[str, Any] = {
-    # ---- 长度约束 ----
-    "max_chars_per_segment": 45,
-    "max_chars_total": 120,
-    "max_sentences_per_segment": 2,
-
-    # ---- 段数约束：这是治「每次都说两个气泡」的关键 ----
-    "min_segments": 1,
-    "max_segments": 4,
-    "default_segments": 1,
-    "segments_note": (
-        "默认只发一段。只有当下确实同时有「要做的事」和「要说的话」时才拆两段。"
-        "禁止为了凑数而分段。"
-    ),
-
-    # ---- 逐字约束 ----
-    "emoji_allowed": False,
-    "banned_words": [
-        "作为一个AI", "作为AI", "我是人工智能助手", "我是AI助手",
-        "亲爱的用户", "您好，请问有什么可以帮您",
-        "根据我的训练数据", "希望我的回答对您有帮助",
-        "还有什么可以帮到您", "感谢您的使用", "祝您",
-    ],
-
-    # ---- 口吻 ----
-    "pov": "第一人称。不说敬语。不自称第三人称。",
-    "must_use_ratio": 0.5,
-
-    # ---- 反填充：这些模式一旦出现即视为违规 ----
-    "anti_filler": {
-        "opening_reuse_window": 3,     # 最近 N 轮内不得出现相同的开场白
-        "no_trailing_question_streak": 3,  # 连续 N 轮不得都以提问结尾
-        "banned_patterns": [
-            "你在干嘛", "你吃了吗", "你还在吗", "怎么不说话",
-            "有什么可以帮", "还需要别的吗", "还有什么",
-        ],
-        "note": (
-            "不要为了延续对话而提问。用户没有发起新话题时，允许只回复一个动作，"
-            "或者一句话就停。"
-        ),
-    },
-
-    "no_narration_in_dialogue": True,
+    'max_chars_per_segment': 100,
+    'max_chars_total': 400,
+    'min_segments': 1,
+    'max_segments': 6,
+    'default_segments': 1,
+    'emoji_allowed': False,
+    # Tone hints are diagnostics, never a reason to replace a valid reply.
+    'banned_words': ['亲爱的用户', '感谢您的使用', '希望我的回答对您有帮助'],
+    'anti_filler': {'banned_patterns': []},
+    'no_narration_in_dialogue': True,
 }
+
 
 # ---------------------------------------------------------------- 边界策略
 # 第五张卡：平时不出现，一旦触发必须精准执行。
@@ -328,7 +297,11 @@ class Scene:
 
 @lru_cache(maxsize=32)
 def load_character(character_id: str) -> Character:
-    path = config.ASSETS_DIR / f"character_{character_id}.json"
+    if not __import__('re').fullmatch(r'[a-zA-Z0-9_-]{1,80}', character_id):
+        raise ValueError('无效的角色 ID')
+    path = config.DATA_DIR / 'characters' / f'{character_id}.json'
+    if not path.exists():
+        path = config.ASSETS_DIR / f"character_{character_id}.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     return Character(raw=data, id=data.get("id", character_id),
                      name=data.get("identity", {}).get("name", character_id))
@@ -336,6 +309,8 @@ def load_character(character_id: str) -> Character:
 
 @lru_cache(maxsize=64)
 def load_scene(scene_id: str) -> Scene:
+    if not __import__('re').fullmatch(r'[a-zA-Z0-9_-]{1,80}', scene_id):
+        raise ValueError('无效的场景 ID')
     path = config.ASSETS_DIR / "scenes" / f"{scene_id}.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     return Scene(raw=data, id=data.get("id", scene_id),
@@ -350,10 +325,9 @@ def all_scene_ids() -> tuple[str, ...]:
 
 @lru_cache(maxsize=16)
 def all_character_ids() -> tuple[str, ...]:
-    return tuple(sorted(
-        p.stem.replace("character_", "")
-        for p in config.ASSETS_DIR.glob("character_*.json")
-    ))
+    builtins = {p.stem.replace('character_', '') for p in config.ASSETS_DIR.glob('character_*.json')}
+    custom = {p.stem for p in (config.DATA_DIR / 'characters').glob('*.json')}
+    return tuple(sorted(builtins | custom))
 
 
 # ---------------------------------------------------------------- 正交校验
@@ -399,6 +373,10 @@ def validate_assets() -> ValidationReport:
         ch = load_character(cid)
         raw = ch.raw
 
+        if raw.get('description') is not None:
+            if not ch.name or not str(raw['description']).strip():
+                rep.errors.append(f'[{cid}] 名称和角色描述不能为空')
+            continue
         if not ch.core_trait.get("contradiction"):
             rep.errors.append(f"[{cid}] 缺少性格核心矛盾点")
         if not ch.inner_summary:
@@ -438,25 +416,6 @@ def validate_assets() -> ValidationReport:
                 rep.errors.append(f"[{cid}] 线索 {c.get('id')} 缺少 unlock 条件")
             if not c.get("reveal_line"):
                 rep.warnings.append(f"[{cid}] 线索 {c.get('id')} 缺少 reveal_line")
-
-        # 正交检查：角色卡里不能有场景绑定词
-        blob = json.dumps({
-            "identity": raw.get("identity"),
-            "core_trait": raw.get("core_trait"),
-            "trait_causes": raw.get("trait_causes"),
-            "inner_summary": raw.get("inner_summary"),
-            "values_core": raw.get("values_core"),
-            "speech_style": raw.get("speech_style"),
-            "catchphrases": raw.get("catchphrases"),
-            "cannot_do": raw.get("cannot_do"),
-            "emotion_rules": raw.get("emotion_rules"),
-        }, ensure_ascii=False)
-        bled = [t for t in _SCENE_BLEED_TERMS if t in blob]
-        if bled:
-            rep.errors.append(
-                f"[{cid}] 角色卡里出现了场景绑定词 {bled} —— "
-                "角色卡只能写「她是谁」，这些应移到场景卡"
-            )
 
     # ---------- 场景卡 ----------
     for sid in scene_ids:

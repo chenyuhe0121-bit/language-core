@@ -13,6 +13,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -53,11 +54,14 @@ def check_model() -> int:
         print(f"请创建 {ENV_FILE}，内容参考 .env.example")
         return 1
 
-    payload = json.dumps({
+    request_body = {
         "model": config.LLM_MODEL,
         "messages": [{"role": "user", "content": "回复两个字：收到"}],
-        "max_tokens": 20,
-    }).encode("utf-8")
+        "max_tokens": 64,
+    }
+    if urllib.parse.urlparse(config.LLM_BASE_URL).hostname == 'api.deepseek.com':
+        request_body['thinking'] = {'type': 'disabled'}
+    payload = json.dumps(request_body).encode('utf-8')
 
     req = urllib.request.Request(
         f"{config.LLM_BASE_URL}/chat/completions",
@@ -72,6 +76,9 @@ def check_model() -> int:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         text = data["choices"][0]["message"]["content"].strip()
+        if not text:
+            print("模型返回空内容，连通性未通过。")
+            return 1
         usage = data.get("usage", {})
         print(f"连通正常。模型 {config.LLM_MODEL} 返回：{text}")
         print(f"本次用量：{usage.get('prompt_tokens')} + {usage.get('completion_tokens')} tokens")

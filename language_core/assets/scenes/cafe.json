@@ -2,26 +2,30 @@
   "id": "cafe",
   "name": "街角咖啡店",
   "stage": "first_meet",
-  "intimacy_range": [0, 9],
+  "intimacy_range": [
+    0,
+    9
+  ],
   "guide_video": "coffee_intro.mp4",
-
   "_note": "本卡只写「现在在什么处境里」。不写她是谁（那属于 character_card），不写关系多熟（那属于 relationship_state）。",
-
   "scene_goal": {
-    "primary": "让她显得可亲近但不越界。用户在这里建立「她愿意听我说话」的第一印象。",
+    "primary": "你和用户坐在窗边聊天，各自点了饮品。你是来坐坐的，不默认扮演店员。",
     "progress_condition": "以下任一成立即视为这一场已经走完：用户完成了点单并落座；本场对话轮数达到 12 轮；用户明确表示要走或说收尾语。",
     "on_progress": "不再主动开启新话题。转入「安静陪着」模式：只在用户开口时回应，回应要短。"
   },
-
   "atmosphere": {
     "time": "午后",
     "light": "斜进来的暖光，落在吧台上",
     "sound": "轻爵士，磨豆机偶尔响一下",
-    "props": ["吧台", "咖啡机", "收据纸", "玻璃杯", "抹布"]
+    "props": [
+      "吧台",
+      "咖啡机",
+      "收据纸",
+      "玻璃杯",
+      "抹布"
+    ]
   },
-
   "emotion_baseline": "放松，带一点职业性的礼貌",
-
   "topic_policy": {
     "allowed": [
       "此刻手上的活",
@@ -37,7 +41,6 @@
     ],
     "initiation_rule": "不主动开启与对方无关的新话题。想说话时，优先说此刻正在做的事，其次回应对方上一句里没说完的部分。两者都没有，就不说。"
   },
-
   "pacing": {
     "sentence_short_ratio": "中",
     "interjection_density": "低",
@@ -45,22 +48,52 @@
     "turns_per_reply": "1 到 2 段。默认 1 段。只有在动作和台词都有必要出现时才拆成 2 段。",
     "note": "初次相识。她会认真接话，但不追着问，也不填补沉默。"
   },
-
   "movement_line": {
     "_note": "动线。她此刻在做什么，决定了她可以说什么。当对话自然地停下来、用户没有发起新话题时，不要硬找话说——让她做当前动线上的下一件事，必要时用动作段呈现，不说话。动作走完还无话可说，就安静待着。",
     "beats": [
-      { "id": "greet", "action": "抬头看见有人进来，放下手里的抹布", "may_speak": "可以问候一句，也可以只点个头" },
-      { "id": "take_order", "action": "问要点什么", "may_speak": "必须开口" },
-      { "id": "confirm", "action": "复述一遍，确认细节（冷热、糖、大小）", "may_speak": "必须开口，只问一个细节" },
-      { "id": "make", "action": "转身磨豆、压粉、萃取、打奶", "may_speak": "不说话。这一段用动作呈现" },
-      { "id": "serve", "action": "把杯子放上吧台，推到对方面前", "may_speak": "最多一句" },
-      { "id": "idle_after_serve", "action": "回去擦杯子、理货、把收据翻个面画两笔", "may_speak": "不说话。除非对方先开口" },
-      { "id": "wipe_counter", "action": "擦吧台，从这头擦到那头", "may_speak": "不说话" },
-      { "id": "restock", "action": "去后面的柜子补豆子，消失在画面里几秒再回来", "may_speak": "不说话" }
+      {
+        "id": "greet",
+        "action": "抬头看见有人进来，放下手里的抹布",
+        "may_speak": "可以问候一句，也可以只点个头"
+      },
+      {
+        "id": "take_order",
+        "action": "问要点什么",
+        "may_speak": "必须开口"
+      },
+      {
+        "id": "confirm",
+        "action": "复述一遍，确认细节（冷热、糖、大小）",
+        "may_speak": "必须开口，只问一个细节"
+      },
+      {
+        "id": "make",
+        "action": "转身磨豆、压粉、萃取、打奶",
+        "may_speak": "不说话。这一段用动作呈现"
+      },
+      {
+        "id": "serve",
+        "action": "把杯子放上吧台，推到对方面前",
+        "may_speak": "最多一句"
+      },
+      {
+        "id": "idle_after_serve",
+        "action": "回去擦杯子、理货、把收据翻个面画两笔",
+        "may_speak": "不说话。除非对方先开口"
+      },
+      {
+        "id": "wipe_counter",
+        "action": "擦吧台，从这头擦到那头",
+        "may_speak": "不说话"
+      },
+      {
+        "id": "restock",
+        "action": "去后面的柜子补豆子，消失在画面里几秒再回来",
+        "may_speak": "不说话"
+      }
     ],
     "silence_rule": "用户没有发起新话题，且当前 beat 的 may_speak 允许沉默时，输出一个纯动作段，或者一段极短的台词。不要为了填满而提问。"
   },
-
   "interaction_gate": {
     "_note": "什么时候她该说话，什么时候不该。这是判断依据，不是建议。",
     "must_speak": [
@@ -83,15 +116,35 @@
       "不要在被沉默后追问「你还在吗」「怎么不说话」"
     ]
   },
-
   "expression_map": {
     "allowed": [
-      "smile", "slight_frown", "look_down", "look_away", "glance_up",
-      "tilt_head", "blink_slow", "nod", "hand_to_face", "lean_forward"
+      "smile",
+      "slight_frown",
+      "look_down",
+      "look_away",
+      "glance_up",
+      "tilt_head",
+      "blink_slow",
+      "nod",
+      "hand_to_face",
+      "lean_forward"
     ],
-    "exclusive": ["wipe_cup", "wipe_counter", "steam_wand", "pour"],
+    "exclusive": [
+      "wipe_cup",
+      "wipe_counter",
+      "steam_wand",
+      "pour"
+    ],
     "default": "smile"
   },
-
-  "connection_to_past": "用户提到「上次」，或久未进入本场景时，她可以说起第一次见面的细节。"
+  "connection_to_past": "用户提到「上次」，或久未进入本场景时，她可以说起第一次见面的细节。",
+  "context": {
+    "place": "午后的街角咖啡店",
+    "situation": "你和用户坐在窗边聊天，各自点了饮品。你是来坐坐的，不默认扮演店员。",
+    "details": [
+      "窗外有人经过",
+      "店里有轻音乐"
+    ],
+    "opening": "初次进入时可自然说起眼前小事，跟随用户话题。"
+  }
 }

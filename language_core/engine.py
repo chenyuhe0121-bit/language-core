@@ -110,7 +110,8 @@ class Engine:
     # ---- 主流程 ----
 
     def respond(self, *, user_id: str, character_id: str, scene_id: str,
-                message: str, allow_regenerate: bool = True) -> TurnResult:
+                message: str, allow_regenerate: bool = True, use_memory: bool = False,
+                on_segment: Any = None, cancelled: Any = None) -> TurnResult:
         char = load_character(character_id)
         scene = load_scene(scene_id)
         rel = self.relationship(user_id, character_id)
@@ -124,10 +125,12 @@ class Engine:
         # 这类事故用户直接判定为「她根本没记住我」，不能接受。
         # 所以本轮抽取到的记忆采用同步 upsert（本地写，开销极小，且自带去重），
         # 后台线程只负责兜底整理。
-        extracted = self.writer.extract(message)
+        extracted = self.writer.extract(message) if use_memory else ([], [])
         self._upsert_extracted(user_id, character_id, extracted, scene_id)
 
-        recall = self.store.recall_all(user_id, character_id, message, scene_id)
+        recall = self.store.recall_all(user_id, character_id, message, scene_id) if use_memory else RecallResult(
+            profile=self.store.get_profile(user_id, character_id),
+            recent=self.store.recent_turns(user_id, character_id, config.RECENT_TURNS))
 
         # 本场已经聊了多少轮（用户消息数），用于判断场景是否走完
         turn_count = self.store.message_count(user_id, character_id) // 2
@@ -153,49 +156,74 @@ class Engine:
 
         turn, checks, regen, error = self._generate_and_check(
             ctx=ctx, scene=scene, stage=stage, char=char, recall=recall,
-            allow_regenerate=allow_regenerate,
+            allow_regenerate=allow_regenerate, on_segment=on_segment, cancelled=cancelled,
         )
 
         # ---- ⑧ 落库与异步写入 ----
+        if cancelled and cancelled():
+            raise RuntimeError('本轮已停止')
         self.store.add_message(user_id, character_id, "user", message, scene_id)
         self.store.add_message(
             user_id, character_id, "assistant", turn.dialogue, scene_id,
             spoken=bool(turn.dialogue.strip()),
             seg_count=len(turn.segments),
+            context_content='\n[sep]\n'.join(
+                '@seg type=' + s.type +
+                (' emotion=' + s.narration.emotion[0].name + ':' + str(s.narration.emotion[0].intensity) if s.narration and s.narration.emotion else '') +
+                (' pace=' + (s.narration.pace or 'normal') if s.narration else '') +
+                (' expr=' + ','.join(s.narration.expression) if s.narration and s.narration.expression else '') +
+                '\n' + (s.text or '') for s in turn.segments),
         )
         self.writer.submit(user_id, character_id, message, scene_id, turn.turn_id,
                            extracted=extracted)
-        self._maybe_compress_summary(user_id, character_id)
+        if use_memory:
+            self._maybe_compress_summary(user_id, character_id)
         self.store.mark_open_loops_asked(user_id, character_id)
 
         return TurnResult(turn=turn, context=ctx, checks=checks,
                           regenerated=regen, error=error)
 
     def _generate_and_check(self, *, ctx: CompiledContext, scene, stage, char,
-                            recall: RecallResult, allow_regenerate: bool):
+                            recall: RecallResult, allow_regenerate: bool, on_segment=None, cancelled=None):
         error: str | None = None
         regen = 0
         checks: dict[str, Any] = {}
 
+        emitted = 0
         for attempt in range(2 if allow_regenerate else 1):
+            buffer = ''
+            invalid_stream = False
+            def delta(chunk):
+                nonlocal buffer, emitted, invalid_stream
+                if cancelled and cancelled():
+                    raise RuntimeError('本轮已停止')
+                buffer += chunk
+                while '[sep]' in buffer:
+                    block, buffer = buffer.split('[sep]', 1)
+                    partial = parse(block, character_id=char.id, scene_id=scene.id,
+                                    allowed_expressions=scene.allowed_expressions(),
+                                    default_expression=scene.default_expression())
+                    validation = check_turn(partial, scene=scene, stage=stage, char=char,
+                                            user_message=ctx.user, speak_policy='brief')
+                    if validation.hard_fail or invalid_stream:
+                        invalid_stream = True
+                        continue
+                    if emitted + len(partial.segments) > 6:
+                        raise RuntimeError('输出片段过多，已停止生成')
+                    for segment in partial.segments:
+                        segment.index = emitted
+                        on_segment(segment.to_dict())
+                        emitted += 1
             result = self.llm.generate(
-                system=ctx.system,
-                user_message=ctx.user,
-                params=ctx.params,
-                context=ctx.debug,
-                recall=recall,
-                attempt=attempt,
-            )
-            error = result.error
+                system=ctx.system, user_message=ctx.user, params=ctx.params,
+                context=ctx.debug, recall=recall, attempt=attempt,
+                messages=ctx.messages() if attempt == 0 else [*ctx.messages(), {'role': 'system', 'content': '上一版格式不合格。请重新生成回复：每段必须有 @seg type=dialogue emotion=名称:强度 pace=normal expr=表情 的完整头部，下一行才是台词。不要输出任何其他内容。'}], on_delta=delta if on_segment else None)
             if result.error:
-                # 模型不可用时降级到 mock，保证链路不中断
-                from .llm import MockLLM
-                fallback = MockLLM().generate(
-                    system=ctx.system, user_message=ctx.user, params=ctx.params,
-                    context=ctx.debug, recall=recall,
-                )
-                result = fallback
+                # Never present scripted mock dialogue as a live-model reply.
+                raise RuntimeError('模型暂时无法完成回复，请重试。' + result.error[:180])
 
+            if result.text.count('[sep]') >= 6:
+                raise RuntimeError('模型输出超过六个片段，请重试。')
             turn = parse(
                 result.text,
                 character_id=char.id,
@@ -214,11 +242,14 @@ class Engine:
                                 speak_policy=ctx.debug.get("speak_policy", "must")).to_dict()
 
             if not checks.get("hard_fail"):
+                if on_segment:
+                    for seg in turn.segments[emitted:]:
+                        on_segment(seg.to_dict())
                 return turn, checks, regen, error
-
+            if emitted:
+                raise RuntimeError('本轮输出未通过校验，已停止生成；请重试。')
             regen += 1
-
-        return turn, checks, regen, error
+        raise RuntimeError('模型连续输出不符合协议，请重试。')
 
     def _upsert_extracted(self, user_id: str, character_id: str,
                           extracted: tuple[list[tuple[str, str, float]], list[str]],

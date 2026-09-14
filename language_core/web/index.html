@@ -1,76 +1,24 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Language Core · 语言系统内核</title>
-<link rel="stylesheet" href="/app.css">
-</head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Muse · 角色对话</title><link rel="stylesheet" href="/app.css"></head>
 <body>
 <div class="app">
-
-  <aside class="side">
-    <div class="brand">
-      <div class="brand-name">Language Core</div>
-      <div class="brand-sub">语言系统内核 v0.1</div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-title">当前状态</div>
-      <div class="kv"><span>场景</span><b id="s-scene">—</b></div>
-      <div class="kv"><span>关系阶段</span><b id="s-stage">—</b></div>
-      <div class="kv"><span>亲密度</span><b id="s-intimacy">—</b></div>
-      <div class="kv"><span>模式</span><b id="s-mode">—</b></div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-title">场景（未解锁不可进入）</div>
-      <div id="scene-list" class="scene-list"></div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-title">
-        她记住的事
-        <button id="btn-memory-refresh" class="mini">刷新</button>
-      </div>
-      <div id="memory-list" class="memory-list"></div>
-      <div class="panel-title" style="margin-top:12px">还没结的事</div>
-      <div id="loop-list" class="memory-list"></div>
-    </div>
-
-    <div class="panel danger">
-      <button id="btn-export" class="mini">导出我的数据</button>
-      <button id="btn-wipe" class="mini danger-btn">删除全部记忆</button>
-    </div>
-  </aside>
-
-  <main class="main">
-    <header class="topbar">
-      <div>
-        <div class="title" id="h-scene">加载中…</div>
-        <div class="subtitle" id="h-goal"></div>
-      </div>
-      <div class="topbar-right">
-        <button id="btn-debug" class="mini">调试面板</button>
-      </div>
-    </header>
-
-    <div class="stage">
-      <section class="chat">
-        <div id="messages" class="messages"></div>
-        <div class="composer">
-          <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
-          <button id="btn-send">发送</button>
-        </div>
-      </section>
-
-      <aside id="debug" class="debug hidden">
-        <div class="panel-title">本轮决策</div>
-        <div id="debug-body" class="debug-body">还没有对话。</div>
-      </aside>
-    </div>
-  </main>
+<aside class="sidebar" id="sidebar">
+ <div class="brand"><span class="brand-mark">m</span><div>Muse<span>让每个角色，有自己的声音</span></div></div>
+ <div class="section-heading">与你交谈的人 <button id="add-character" class="text-button">＋ 创建</button></div>
+ <div id="characters" class="characters"></div>
+ <button id="new-chat" class="new-chat">＋ 开始新的对话</button>
+ <div class="section-heading history-heading">最近的对话</div>
+ <div id="sessions" class="sessions"></div>
+ <div class="sidebar-foot"><span class="status-dot"></span><span id="model-status">正在连接…</span><button id="export" class="text-button" title="导出当前对话与反馈">导出</button></div>
+</aside>
+<main>
+ <header class="topbar"><button id="menu" class="icon-button mobile-only" aria-label="显示侧栏">☰</button><div class="avatar small" id="header-avatar">E</div><div class="header-name"><h1 id="character-name">正在连接</h1><p id="character-tagline">角色对话工作台</p></div><div class="header-actions"><button id="voice" class="quiet-button" aria-pressed="false">试听：关</button><button id="inspect" class="quiet-button" aria-expanded="false">对话详情</button></div></header>
+ <div class="context-bar"><label>此刻 <select id="scene" aria-label="选择场景"></select></label><span class="context-divider"></span><label>关系 <select id="relationship" aria-label="关系程度"><option value="0">刚认识</option><option value="10">逐渐熟悉</option><option value="20">相处自在</option><option value="30">亲近</option><option value="40">稳定信任</option></select></label><span class="context-hint">场景变了，仍然是同一个人</span></div>
+ <div class="workspace"><section class="chat"><div id="messages" class="messages" aria-live="polite"></div><div id="notice" class="notice" role="status"></div><form id="composer" class="composer"><div class="input-wrap"><textarea id="input" rows="1" placeholder="说说你此刻想到的事…" aria-label="聊天消息" maxlength="6000"></textarea><button type="button" id="stop" class="stop hidden">停止</button><button type="submit" id="send" aria-label="发送消息">↑</button></div><div class="composer-foot"><span>Enter 发送 · Shift + Enter 换行</span><span id="generation-status">台词与情绪同步生成</span></div></form></section>
+ <aside id="inspector" class="inspector hidden"><div class="section-heading">对话详情 <button id="close-inspector" class="text-button">关闭</button></div><p class="muted">情绪标签属于角色的表达，不会被朗读。</p><div id="debug"><p class="muted">发送消息后可查看情绪、耗时和实际提示词。</p></div><hr><label class="memory-toggle"><input type="checkbox" id="memory-enabled">启用本会话长期记忆实验</label><p class="muted">默认只使用当前会话历史，便于验证角色表现。</p><div id="memory"></div></aside></div>
+</main>
 </div>
-<script src="/app.js"></script>
-</body>
-</html>
+<dialog id="card-dialog"><form id="card-form"><div class="dialog-head"><div><span class="eyebrow">CHARACTER STUDIO</span><h2>让一个新角色登场</h2></div><button type="button" id="close-card" class="icon-button" aria-label="关闭">×</button></div><p class="muted">写清楚这个人关心什么、如何回应别人。用几段对话示范，比堆叠形容词更具体。</p><label>角色名称<input id="card-name" required maxlength="60" placeholder="这个角色叫什么"></label><label>角色描述<textarea id="card-description" required rows="4" maxlength="18000" placeholder="身份、生活、兴趣、重要经历…"></textarea></label><label>性格与说话方式<textarea id="card-personality" rows="3" placeholder="对什么好奇？意见不同时怎么说？开心和失落时有什么区别？"></textarea></label><label>开场白<input id="card-greeting" maxlength="1000" placeholder="一句适合直接说出口的话"></label><label>对话示例<textarea id="card-examples" rows="4" placeholder="用户：我今天又迟到了。&#10;角色：你那个闹钟是不是只负责装饰？"></textarea></label><div class="import-row"><label class="quiet-button file-label">导入 JSON 角色卡<input type="file" id="card-file" accept=".json,application/json" hidden></label><span class="muted">支持 Tavern V2 / V3 的基础角色字段</span></div><p id="card-error" class="error"></p><button id="save-card" class="primary-button" type="submit">保存并开始聊天</button></form></dialog>
+<dialog id="feedback-dialog"><form id="feedback-form"><div class="dialog-head"><h2>这句哪里不合适？</h2><button type="button" id="close-feedback" class="icon-button">×</button></div><p class="muted">你的具体感受会与这轮提示词和回复一起保存，方便后续改进。</p><textarea id="feedback-note" rows="4" maxlength="2000" placeholder="例如：没接住我的话；不像这个角色；连续追问让我觉得累…"></textarea><button class="primary-button" type="submit">保存反馈</button></form></dialog>
+<script src="/app.js"></script></body></html>

@@ -114,6 +114,8 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     spoken = [s for s in turn.segments if s.spoken and s.text]
     all_text = "".join(s.text or "" for s in turn.segments if s.text)
     dialogue = turn.dialogue
+    res.add('nonempty_turn', any((s.text or '').strip() for s in turn.segments), hard=True,
+            detail='' if turn.segments else '模型没有生成内容')
 
     # V1 至少一段可朗读。
     # 例外：编译器判定这一轮「不必多说」或「允许沉默」时，
@@ -126,6 +128,10 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
         res.add("V1_has_spoken", bool(spoken), hard=True,
                 detail="" if spoken else "整轮没有可朗读的台词")
 
+    metadata_ok = all(s.narration and s.narration.emotion and s.narration.pace and s.narration.expression for s in spoken)
+    res.add('speech_metadata', bool(metadata_ok), hard=True,
+            detail='' if metadata_ok else '台词缺少情绪、语速或表情')
+
     # V6 台词中不残留格式标记 —— 硬失败
     residue = any(mark in dialogue for mark in ("@seg", "[sep]"))
     res.add("V6_no_format_residue", not residue, hard=True,
@@ -134,7 +140,7 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     # V10 禁用词 —— 硬失败
     banned_hits = [w for w in STYLE_ANCHOR["banned_words"] if w in all_text]
     banned_hits += [w for w in _AI_TONE if w in all_text]
-    res.add("V10_no_banned_words", not banned_hits, hard=True,
+    res.add("V10_no_banned_words", not banned_hits, hard=False,
             detail="、".join(sorted(set(banned_hits))))
 
     # V7 段数：默认 1 段，上限按风格锚点
@@ -172,7 +178,7 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     for s in turn.segments:
         if s.narration:
             for e in s.narration.emotion:
-                if e.intensity > stage.intensity_cap + 1e-6:
+                if not 0 <= e.intensity <= 1:
                     over.append(f"{e.name}:{e.intensity}")
     res.add("V8_intensity_cap", not over, detail="、".join(over))
 
@@ -191,9 +197,8 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     # 这不是「出现问号就违规」——点单确认、问候本来就要问。
     # 真正的问题是两种：用户提问她不答反问；用户只是陈述，她用提问来填话。
     if spoken:
-        all_questions = all(
-            re.search(r"[？?]\s*$", (s.text or "").strip()) for s in spoken
-        )
+        sentences_with_ends = re.findall(r'[^。！？!?]+[。！？!?]?', dialogue)
+        all_questions = bool(sentences_with_ends) and all(re.search(r'[？?]$', x.strip()) for x in sentences_with_ends)
         user_asked = bool(re.search(r"[？?]\s*$", (user_message or "").strip()))
         bad = False
         detail = ""
@@ -227,7 +232,7 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
         "warnings": list(turn.warnings),
     }
 
-    if char is not None:
+    if char is not None and baseline_similarity is not None:
         fp = style_fingerprint(char)
         sim = style_similarity(dialogue, fp)
         metrics["style_similarity"] = sim

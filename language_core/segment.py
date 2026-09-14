@@ -270,12 +270,9 @@ def parse(
     if len(segments) > 6:
         segments = segments[:6]
         warnings.append("V7:truncated_to_6")
-    if len(segments) < 2 and segments:
-        # 少于 2 段不强行补（补出来的是假内容），只记警告
-        warnings.append("V7:fewer_than_2")
 
     # ---- 校验 V2 / V8 / V9 ----
-    cap = STAGE_INTENSITY_CAP.get(stage, DEFAULT_INTENSITY_CAP)
+    cap = 1.0  # 情绪强度不由亲密度决定。
     for seg in segments:
         if seg.narration is None:
             continue
@@ -322,7 +319,7 @@ def _split_blocks(raw: str, warnings: list[str]) -> list[str]:
         # 没有分隔符：按空行切；仍只有一段则整段作为单块
         parts = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
         blocks = parts if parts else [text]
-        if len(blocks) == 1:
+        if len(blocks) > 1:
             warnings.append("missing_separator")
 
     return [b for b in blocks if b]
@@ -455,7 +452,7 @@ def _apply_kv(
                 continue
             # 场景专属动作（exclusive）也算当前场景合法，例如咖啡店的 wipe_cup。
             # 它不是全局表情，但确实是这一场能做的动作。
-            if e not in allowed_expressions and e not in local_expressions:
+            if allowed_expressions is not None and e not in allowed_expressions and e not in local_expressions:
                 warnings.append(f"V5:expression_not_in_scene:{e}")
                 if default_expression:
                     if default_expression not in narration.expression:
