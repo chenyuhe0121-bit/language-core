@@ -5,6 +5,8 @@ let importedScenario='',requestId=null;
 let characters=[],scenes=[],sessions=[],state=null,current=null,busy=false,controller=null,voice=false,feedbackTurn=null,lastDebug=null;
 const moods={neutral:'平静',happy:'开心',concern:'关切',sad:'难过',playful:'俏皮',shy:'害羞',annoyed:'不悦',surprised:'惊讶'};
 const paces={slow:'慢',normal:'自然',fast:'快',very_slow:'很慢',very_fast:'很快'};
+const intents={comfort:'安慰',tease:'打趣',probe:'追问',share:'分享',invite:'邀请',deflect:'岔开',refuse:'拒绝',agree:'应下',reminisce:'忆旧',idle:'随口'};
+const expressions={smile:'微笑',grin:'笑开',wry_smile:'苦笑',surprised:'惊讶',slight_frown:'微皱眉',frown:'皱眉',look_down:'低头',look_away:'移开视线',glance_up:'抬眼',tilt_head:'偏头',lean_forward:'前倾',lean_back:'后靠',blink_slow:'慢眨眼',eyes_wide:'睁大眼',nod:'点头',shake_head:'摇头',hand_to_face:'手扶脸',fidget:'小动作',wipe_cup:'擦杯子',wipe_counter:'擦吧台',steam_wand:'打奶泡',pour:'倒咖啡',hold_cup_both_hands:'双手捧杯',pull_blanket:'拉毯子',put_needle_down:'放唱针',point_far:'指远处',hug_arm:'拉手臂',tuck_hair:'拢头发',jump:'跳一下',cover_eyes:'捂眼',hold_balloon:'拿气球',lie_side:'侧躺',close_eyes:'闭眼',reach_hand:'伸手',turn_off_light:'关灯'};
 async function api(path,body){const res=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await res.json();if(!res.ok)throw Error(data.error||'请求失败');return data;}
 function qs(){return '?session_id='+encodeURIComponent(current);}
 function notice(text,error=false){$('notice').textContent=text;$('notice').classList.toggle('error',error);}
@@ -22,7 +24,36 @@ async function openSession(id){if(busy)return;current=id;localStorage.setItem('m
 async function newChat(characterId=state?.character.id||'elise'){if(busy)return;const {session}=await api('/api/sessions',{character_id:characterId,scene_id:$('scene').value||'cafe'});await refreshSessions();await openSession(session.id);}
 function userTurn(text){const w=document.createElement('div');w.className='turn user';w.innerHTML=`<div class="speaker">你</div><div class="bubble">${esc(text)}</div>`;$('messages').append(w);scroll();return w;}
 function assistantTurn(){const w=document.createElement('div');w.className='turn assistant';w.innerHTML=`<div class="speaker">${esc(state.character.name)}</div>`;$('messages').append(w);return w;}
-function appendSegment(w,s){const d=document.createElement('div');d.className=s.spoken?'bubble':'narration';d.textContent=s.text||'';if(s.narration?.emotion?.length)d.title=s.narration.emotion.map(e=>`${moods[e.name]||e.name} ${e.intensity}`).join(' · ');w.append(d);scroll();}
+function appendSegment(w,s){
+  const box=document.createElement('div');box.className='segment';
+  const d=document.createElement('div');d.className=s.spoken?'bubble':'narration';d.textContent=s.text||'';
+  box.append(d);
+  const n=s.narration;
+  if(n){
+    const tags=[];
+    for(const e of (n.emotion||[])){
+      const pct=Math.round((Number(e.intensity)||0)*100);
+      tags.push({k:'mood',label:`情绪 ${moods[e.name]||e.name}`,meter:pct});
+    }
+    if(n.pace&&paces[n.pace])tags.push({k:'pace',label:`语速 ${paces[n.pace]}`});
+    if(n.intent)tags.push({k:'intent',label:`意图 ${intents[n.intent]||n.intent}`});
+    for(const x of (n.expression||[]))tags.push({k:'expr',label:`表情 ${expressions[x]||x}`});
+    if(tags.length){
+      const bar=document.createElement('div');bar.className='segment-tags';
+      for(const t of tags){
+        const el=document.createElement('span');el.className='tag '+t.k;el.textContent=t.label;
+        if(t.meter!==undefined){
+          const m=document.createElement('i');m.className='meter';m.style.width=t.meter+'%';
+          m.title=`强度 ${(t.meter/100).toFixed(1)}`;el.append(m);
+        }
+        bar.append(el);
+      }
+      box.append(bar);
+      if(!s.spoken)box.classList.add('quiet');
+    }
+  }
+  w.append(box);scroll();
+}
 function speak(s){if(!voice||!s.spoken||!s.text||!('speechSynthesis'in window))return;const u=new SpeechSynthesisUtterance(s.text);u.lang='zh-CN';u.rate={slow:.85,fast:1.15}[s.narration?.pace]||1;u.onstart=()=>{$('generation-status').textContent='试听 · '+(s.narration?.emotion||[]).map(e=>moods[e.name]||e.name).join(' / ');};u.onend=()=>{if(!speechSynthesis.pending&&!busy)$('generation-status').textContent='台词与情绪同步生成';};speechSynthesis.speak(u);}
 function finishTurn(w,payload,feedback={}){const d=payload.debug||{};const actions=document.createElement('div');actions.className='turn-actions';actions.innerHTML=`<button data-like class="${feedback?.rating===1?'selected':''}">喜欢</button><button data-dislike class="${feedback?.rating===-1?'selected':''}">不合适</button><button data-detail>详情</button><button data-play>朗读</button><span class="timing">${d.first_segment_ms!=null?'首段 '+(d.first_segment_ms/1000).toFixed(1)+'s':(d.latency_ms/1000).toFixed(1)+'s'}</span>`;actions.querySelector('[data-like]').onclick=()=>guard(async()=>{await api('/api/feedback',{session_id:current,turn_id:payload.reply.turn_id,rating:1});actions.querySelector('[data-like]').classList.add('selected');actions.querySelector('[data-dislike]').classList.remove('selected');notice('已保存这条回复的反馈。');});actions.querySelector('[data-dislike]').onclick=()=>{feedbackTurn={id:payload.reply.turn_id,actions};$('feedback-note').value=feedback?.note||'';$('feedback-dialog').showModal();};actions.querySelector('[data-detail]').onclick=()=>{debug(payload);$('inspector').classList.remove('hidden');};actions.querySelector('[data-play]').onclick=()=>{if(!('speechSynthesis'in window)){notice('当前浏览器不支持试听。',true);return;}speechSynthesis.cancel();const previous=voice;voice=true;payload.reply.segments.forEach(speak);voice=previous;notice('浏览器声音试听，尚未接入产品 TTS 与视频形象。');};w.append(actions);}
 function debug(payload){lastDebug=payload;const d=payload.debug||{};const checks=d.checks||{};$('debug').innerHTML=`<h3>本轮表达</h3>${payload.reply.segments.map(s=>`<p>${esc(s.text)}</p><div>${(s.narration?.emotion||[]).map(e=>`<span class="badge">${esc(moods[e.name]||e.name)} ${e.intensity}</span>`).join('')}<span class="badge">${esc(paces[s.narration?.pace]||'自然')}</span>${(s.narration?.expression||[]).map(e=>`<span class="badge">${esc(e)}</span>`).join('')}</div>`).join('')}<h3>生成信息</h3><pre>${esc(JSON.stringify({model:payload.reply.meta?.model,prompt:d.context?.prompt_version,first_segment_ms:d.first_segment_ms,total_ms:d.latency_ms,history_messages:d.context?.recent_count,mode:d.mode,regenerated:d.regenerated},null,2))}</pre><h3>协议检查</h3><p>${checks.hard_fail?'未通过':'可解析'}${checks.warnings?.length?' · 有风格提示':''}</p><p class="muted">协议通过不等于对话质量通过；自然度与人设以你的体验为准。</p><details><summary>实际发送给模型的消息</summary><pre>${esc(JSON.stringify(d.messages||[],null,2))}</pre></details><details><summary>上下文使用量</summary><pre>${esc(JSON.stringify(d.budget,null,2))}</pre></details><details><summary>完整输出协议</summary><pre>${esc(JSON.stringify(payload.reply,null,2))}</pre></details>`;}

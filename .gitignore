@@ -13,8 +13,12 @@ data/*.db-wal
 data/_*
 .tmp/
 
-# ---- 一次性运维工具（含本地凭据文件依赖，不进仓库）----
+# ---- 打包产物（make_package.py 生成，不进仓库）----
+dist/
+
+# ---- 一次性运维工具（依赖本地凭据文件，不进仓库）----
 tools/push_to_github.py
+tools/push_history.py
 
 # ---- Python ----
 __pycache__/

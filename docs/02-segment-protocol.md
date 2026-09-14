@@ -114,9 +114,19 @@ neutral 平静、happy 开心、concern 关切、sad 难过、playful 俏皮、s
 
 ## 校验规则
 
-V1 至少有一个 spoken 段落。V2 emphasis 必须是 text 子串。V3 emotion.name 在情绪表内。V4 intensity 在 0 到 1。V5 expression 在场景白名单内。V6 dialogue 中不残留括号或 @seg。V7 段数在 2 到 6。V8 intensity 不超过当前阶段上限。V9 台词总字数不超上限。V10 台词不含禁用词。
+V1 至少有一个 spoken 段落。V2 emphasis 必须是 text 子串。V3 emotion.name 在情绪表内。V4 intensity 在 0 到 1。V5 expression 在场景白名单内。V6 dialogue 中不残留括号或 @seg。V7 段数在 1 到 6 之间。V8 intensity 不超过当前阶段上限。V9 台词长度不超上限。V10 台词不含禁用词。
+
+长度上限取自 `persona.STYLE_ANCHOR`（当前：单段 100 字、整轮 400 字）。它是唯一的数值来源，改那里即可，不要在两处各写一份。
 
 V1、V6、V10 是硬失败需要重生成，其余软降级。
+
+防「没话找话」的补充规则，同样机械判定：
+
+- A1 不得出现填话句式（「你还在吗」「还需要别的吗」这类）
+- A2 用户提问时不得整轮反问；收尾与允许沉默的策略下不得整轮反问
+- A3 不得逐字复述用户刚说过的话
+
+**一条下游必须知道的例外**：编译器判定本轮不必多说或允许沉默时（`speak_policy` 为 `brief` 或 `may_silent`），只有动作、没有台词是**正确行为**，不算失败。收到 `spoken` 全为 false 的一轮是合法的，TTS 应当跳过该轮而非报错。
 
 ## 下游适配器边界
 

@@ -15,7 +15,7 @@ Muse 产品的语言系统独立内核。负责角色怎么想、记得什么、
 }
 ```
 
-下游拿到 dialogue 合成语音，拿到 narration 驱动语气、表情、动作。两者严格分离。
+下游拿到 `dialogue` 合成语音，拿到 `narration` 驱动语气、表情、动作。两者严格分离。
 
 ## 为什么单独建这个项目
 
@@ -27,10 +27,10 @@ FLP 解决了传输、形象驱动和语音，companion-prototype 解决了界�
 |---|---|
 | docs/00-vision.md | 目标、边界、设计原则、成功标准 |
 | docs/01-tech-stack.md | 八项技术决策与理由 |
-| docs/02-segment-protocol.md | 台词/旁白协议 segproto/1 |
-| docs/03-architecture.md | 八个环节、五张卡、记忆四层、校验器 |
+| docs/02-segment-protocol.md | 台词/旁白协议 segproto/1，**与下游的契约** |
+| docs/03-architecture.md | 链路、提示词结构、卡格式、记忆、校验、缺口 |
 | docs/04-reading-the-memory-system.md | 记忆系统代码导读 |
-| docs/05-five-part-architecture.md | 五段式提示词架构 |
+| docs/05-legacy-five-part-architecture.md | 历史设计存档（已不再生效） |
 | docs/06-git-sync.md | 同步到 GitHub |
 
 ## 运行
@@ -40,9 +40,9 @@ python run.py
 # http://127.0.0.1:8420
 ```
 
-零第三方依赖，任何装了 Python 3.9 以上的机器直接能跑。
+零第三方依赖，任何装了 Python 3.9 以上的机器直接能跑，不需要 pip 装任何东西。
 
-模型配置放在 `data/llm.env`（该目录不进版本库，key 不会跟着代码走）：
+模型配置放在 `data/llm.env`（该目录不进版本库，密钥不会跟着代码走）：
 
 ```
 LANGUAGE_CORE_LLM_API_KEY=sk-xxx
@@ -53,73 +53,87 @@ LANGUAGE_CORE_LLM_MODEL=deepseek-flash
 三种启动方式：
 
 ```bash
-python run.py                 # 有配置走真实模型，没配置走离线 mock
-python run.py --check         # 只验证模型连通性，不启动服务
-python run.py --mock          # 强制离线，用于跑测试和离线演示
+python run.py           # 有配置走真实模型，没配置走离线管道演示
+python run.py --check   # 只验证模型连通性，不启动服务
+python run.py --mock    # 强制离线，用于跑测试
 ```
 
-`data/llm.env` 不存在时自动降级为 mock，不会报错。mock 的回复是按协议写死的，
-只用于验证管道；真实对话必须接模型。
+`data/llm.env` 不存在时会降级到离线模式，不会报错。**但离线模式的回复是按关键词写死的脚本，只能用来验证管道通不通，不能用来评判角色质量。** 页面右上角会显示当前是真实模型还是离线演示。
 
-想让服务直接听环境变量也可以，不建文件即可：
+## 界面怎么用
 
-```bash
-set LANGUAGE_CORE_LLM_API_KEY=sk-xxx
-python -m language_core.server
-```
+打开 http://127.0.0.1:8420 后：
 
-## 看看真实模型收到什么
+- **左侧**：角色列表（可新增）、会话列表（可新建）、记忆与未闭合话题
+- **中间**：对话。每段台词下面有一排彩色标签，显示这一段的**情绪 / 语速 / 意图 / 表情**，情绪标签下的小横条长度就是强度
+- **右上角**：切换场景、调整关系阶段、开关记忆
+- **每条回复下方**：喜欢 / 不合适 / 详情 / 朗读
+- **"＋ 增加角色"**：弹出表单，可手工填，也可直接导入 SillyTavern 的 JSON 角色卡
 
-```bash
-python tools/capture_prompt.py
-```
+## HTTP 接口
 
-它起一个本地假模型服务接收请求，把完整的提示词打印到
-`data/_captured_prompt.txt`。用来确认人设、场景、召回记忆是不是真的注入了。
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/api/health` | 健康检查与资产校验结果 |
+| GET | `/api/characters` | 角色列表 |
+| POST | `/api/characters` | 新增角色（导入或手填，后端自动展开与校验） |
+| GET | `/api/scenes` | 场景列表 |
+| GET | `/api/sessions` | 会话列表 |
+| POST | `/api/sessions` | 新建会话 |
+| GET | `/api/state` | 当前状态 + 历史记录 + 记忆 |
+| POST | `/api/chat` | 发一句话，整轮返回 |
+| POST | `/api/chat/stream` | 发一句话，SSE 按段推送 |
+| POST | `/api/chat/cancel` | 中断正在生成的回复 |
+| POST | `/api/feedback` | 给某轮回复好评/差评与备注 |
+| POST | `/api/session/settings` | 改场景、关系值、记忆开关 |
+| POST | `/api/scene` | 同上，保留的旧别名 |
+| GET | `/api/memory` | 记忆与未闭合话题 |
+| POST | `/api/memory/delete` `/api/memory/update` | 删除 / 修改单条记忆 |
+| GET | `/api/export` | 导出某个会话的全部数据 |
+
+SSE 事件：`start`（开始）→ `segment`（逐段推送，含旁白）→ `done`（整轮 payload）或 `error`。
 
 ## 自检
 
 ```bash
-python -m language_core.persona    # 资产正交校验
-python -m language_core.segment    # 协议解析自检
-python -m language_core.memory     # 记忆系统自检
-python tests/smoke.py              # 端到端冒烟测试
+python -m unittest tests.test_conversation -v   # 24 项结构性测试
+python -m language_core.persona                 # 资产校验
+python -m language_core.segment                 # 协议解析自检
+python tools/capture_prompt.py                  # 抓取真实发给模型的完整提示词
+python tools/quality_probe.py                   # 真模型质量探针（3 角色 × 6 轮追问）
 ```
 
 ## 目录
 
 ```
 language-core/
-├─ docs/              规格文档
+├─ docs/                    规格文档
 ├─ language_core/
-│   ├─ segment.py     协议解析与校验
-│   ├─ compiler.py    上下文编译器
-│   ├─ memory.py      记忆系统（唯一写 SQL 的地方）
-│   ├─ llm.py         模型适配层
-│   ├─ checker.py     校验器
-│   ├─ persona.py     资产加载与正交校验
-│   ├─ engine.py      一轮对话的编排
-│   ├─ server.py      HTTP 服务（唯一可替换层）
-│   ├─ assets/        五张卡的内容
-│   └─ web/           调试界面
-├─ tests/             端到端测试
-└─ data/              运行期数据，不进版本库
+│   ├─ config.py            全部参数集中在这里
+│   ├─ segment.py           台词/旁白协议：解析、校验、封闭枚举
+│   ├─ memory.py            记忆与存储，唯一写 SQL 的地方
+│   ├─ compiler.py          上下文编译器，拼提示词
+│   ├─ llm.py               模型适配：真实接口 + 离线脚本
+│   ├─ checker.py           输出校验与反填充
+│   ├─ persona.py           角色卡/场景卡加载与关系阶段
+│   ├─ cards.py             角色卡导入与展开
+│   ├─ engine.py            一轮对话的编排
+│   ├─ server.py            HTTP 与 SSE（唯一可替换的一层）
+│   ├─ assets/              内置角色卡与场景卡
+│   └─ web/                 前端界面
+├─ tests/                   结构性测试
+├─ tools/                   运维与调试工具
+└─ data/                    运行期数据（密钥、数据库），不进版本库
 ```
 
-## HTTP 接口
+## 下游接入要看什么
 
-| 方法 | 路径 | 作用 |
-|---|---|---|
-| GET | /api/health | 健康检查与资产校验结果 |
-| GET | /api/state | 当前场景、关系阶段、亲密度、已解锁场景 |
-| GET | /api/scenes | 全部场景 |
-| POST | /api/chat | 发一句话，返回台词加旁白与本轮决策 |
-| POST | /api/scene | 切换场景，未解锁返回 403 |
-| GET | /api/memory | 她记住的事与未闭合话题 |
-| POST | /api/memory/delete | 删除单条记忆 |
-| POST | /api/memory/update | 修改单条记忆 |
-| GET | /api/export | 导出全部交互数据 |
-| POST | /api/delete_all | 删除该角色下全部数据 |
+如果要把这个内核接到语音和形象驱动上，读两份就够：
+
+1. **`docs/02-segment-protocol.md`** —— 契约本身。字段、枚举、校验规则、适配器边界
+2. **`docs/03-architecture.md`** —— 一轮对话的链路，以及哪些能力还没接线
+
+有一条要特别注意：**收到 `spoken` 全为 false 的一轮是合法的**（那一轮她只有动作没有台词），TTS 应当跳过而不是报错。
 
 ## 文档写作约定
 
