@@ -338,6 +338,11 @@ class MockLLM:
 
     mode = "mock"
 
+    def __init__(self) -> None:
+        # 记住上一次主动开口说了什么，下次避开它。
+        # 真实模型不会一句话反复说，离线脚本也不该。
+        self._last_proactive = ""
+
     def generate(self, *, system: str, user_message: str, params: dict[str, Any],
                  context: dict[str, Any], recall: RecallResult | None = None,
                  attempt: int = 0, messages: list[dict[str, str]] | None = None,
@@ -432,6 +437,16 @@ class MockLLM:
 
         # 这一轮该说多少，由编译器判断后写进 debug
         policy = (context or {}).get("speak_policy", "must")
+        # 主动开口：没有用户输入，由她起头
+        proactive = (context or {}).get("proactive")
+
+        # ---- 分支 0a：主动开口。必须排最前，否则会被当成沉默回合 ----
+        if proactive:
+            lines = self._proactive_lines(proactive, scene_id, default_expr, attempt,
+                                          int((context or {}).get('turn_count') or 0),
+                                          avoid=self._last_proactive)
+            self._last_proactive = lines[-1]
+            return self._wrap(lines, attempt)
 
         # ---- 点单相关的前置计算：问候分支要用到 drink，所以放在最前 ----
         drink = None
@@ -620,6 +635,71 @@ class MockLLM:
             lines += ["[sep]", "@seg type=inner_thought",
                       _THOUGHTS.get(scene_id, "（她没急着往下说。）")]
         return lines
+
+    @staticmethod
+    def _proactive_lines(kind: str, scene_id: str, default_expr: str,
+                         attempt: int = 0, seed: int = 0,
+                         avoid: str = "") -> list[str]:
+        """离线模式下她主动开口说什么。
+
+        三种方式对应三种话题来源：她自己的状态、她注意到的东西、
+        她想一起做的事。全都避开「你怎么不说话了」这类查岗腔。
+
+        每种给两个候选，并且避开上一句用过的——否则离线测试测不出
+        「主动开口不能重复上一条」这条约束。
+        """
+        table = {
+            "bored": [
+                ["（把手里的杯子转了两圈）……刚才走神了。这光有点晃眼。",
+                 "（撑着下巴看外面）我有点犯困了。也可能是风太舒服。"],
+                ["（把外套拢了拢）坐久了腿有点麻。",
+                 "（盯着地面看了会儿）我刚在想一件很久以前的事。"],
+                ["（打了个哈欠）这音乐听着听着就困了。",
+                 "（把手插进口袋）今天走得比平时远。"],
+                ["（捧着杯子发了会儿呆）雨声听着听着就困了。",
+                 "（把毯子往上拉了拉）今天好像比昨天冷。"],
+                ["（把台灯调暗了一格）……有点困了。",
+                 "（翻了个身）刚才差点睡着。"],
+            ],
+            "noticing": [
+                ["你刚才把杯子转了半圈。",
+                 "你刚才看了眼手机又放下了。"],
+                ["你刚才看了三次河对面。",
+                 "你走路的时候一直在看脚下。"],
+                ["你刚才没跟着音乐点头。",
+                 "你刚才往摩天轮那边看了两次。"],
+                ["你刚才盯着窗户看了好一会儿。",
+                 "你把杯子挪到左手边了。"],
+                ["你翻了个身。",
+                 "你刚才叹了口气。"],
+            ],
+            "inviting": [
+                ["窗边那个位子空出来了，去不去？",
+                 "刚出炉的司康还热着，要不要来一块？"],
+                ["前面拐角有辆卖冰棍的车。去不去？",
+                 "河堤那边有人在放风筝，走近点看看？"],
+                ["欸，套圈那个摊子人少了。去试试？",
+                 "摩天轮那边能看到整片灯，要不要去排？"],
+                ["唱针该翻面了。要不要换一张？",
+                 "杯子里的水凉了，我去换一杯？"],
+                ["台灯有点晃眼，我关小一点？",
+                 "窗没关严，我去关一下？"],
+            ],
+        }
+        rows = table.get(kind) or table["bored"]
+        scene_index = {
+            "cafe": 0, "park": 1, "amusement": 2, "living_room": 3, "bedroom": 4,
+        }.get(scene_id, 0)
+        options = rows[scene_index]
+        # 避开上一句用过的，再按 attempt/seed 轮换
+        fresh = [o for o in options if o != avoid] or options
+        text = fresh[(attempt + seed) % len(fresh)]
+        emotion = {"bored": "neutral", "noticing": "playful", "inviting": "happy"}.get(kind, "neutral")
+        expr = {"bored": "blink_slow", "noticing": "tilt_head", "inviting": default_expr}.get(kind, default_expr)
+        return [
+            f"@seg type=dialogue emotion={emotion}:0.4 pace=normal expr={expr} intent=share",
+            text,
+        ]
 
     @staticmethod
     def _naturalize(content: str) -> str:

@@ -62,4 +62,15 @@ MEMORY_MIN_CONFIDENCE = 0.5
 HOST = os.environ.get("LANGUAGE_CORE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LANGUAGE_CORE_PORT", "8420"))
 
+# ---- 主动开口 ----
+# 视频按分钟计费，冷场就是让用户白花钱。所以对话卡住时由她挑起话头。
+# 但连续追是白烧用户的钱，所以有冷却，以及「一个死胡同只开口一次」两道闸。
+PROACTIVE_ENABLED = os.environ.get("LANGUAGE_CORE_PROACTIVE", "1") not in ("0", "false", "")
+PROACTIVE_IDLE_SECONDS = float(os.environ.get("LANGUAGE_CORE_PROACTIVE_IDLE", "10"))
+PROACTIVE_COOLDOWN_SECONDS = float(os.environ.get("LANGUAGE_CORE_PROACTIVE_COOLDOWN", "60"))
+PROACTIVE_POLL_SECONDS = float(os.environ.get("LANGUAGE_CORE_PROACTIVE_POLL", "3"))
+# 用户至少回几句才解锁下一次主动开口。
+# 只回一个「嗯」不算——那样她会陪着用户一起敷衍，白烧他的钱。
+PROACTIVE_MIN_USER_TURNS = int(os.environ.get("LANGUAGE_CORE_PROACTIVE_MIN_TURNS", "2"))
+
 MODE = "live" if LLM_API_KEY else "mock"

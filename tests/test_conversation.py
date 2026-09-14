@@ -91,6 +91,155 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):self.eng.respond(user_id='u',character_id='elise',scene_id='park',message='回答问题')
         self.assertEqual(self.eng.store.message_count('u','elise'),0)
 
+class ProactiveTests(unittest.TestCase):
+    """主动开口：视频按分钟计费，冷场要由她打破；但不能变成连环催。"""
+
+    def setUp(self):
+        from language_core import proactive
+        self.p = proactive
+        self.cfg = config
+
+    def test_below_threshold_does_not_fire(self):
+        now = self.p.datetime.now(self.p._TZ)
+        last = (now - self.p.timedelta(seconds=3)).isoformat()
+        d = self.p.decide(last_activity_at=last, now=now)
+        self.assertFalse(d.due)
+        self.assertIn('未到', d.reason)
+
+    def test_fires_after_idle_threshold(self):
+        now = self.p.datetime.now(self.p._TZ)
+        last = (now - self.p.timedelta(seconds=self.cfg.PROACTIVE_IDLE_SECONDS + 2)).isoformat()
+        d = self.p.decide(last_activity_at=last, now=now, user_turns_since_proactive=99)
+        self.assertTrue(d.due)
+
+    def test_does_not_fire_while_generating(self):
+        now = self.p.datetime.now(self.p._TZ)
+        last = (now - self.p.timedelta(seconds=60)).isoformat()
+        d = self.p.decide(last_activity_at=last, now=now, generating=True)
+        self.assertFalse(d.due)
+        self.assertIn('正在生成', d.reason)
+
+    def test_single_short_reply_does_not_unlock_next(self):
+        """用户只回一个「嗯」不解锁下一次——否则等于陪他一起敷衍，白烧他的钱。"""
+        now = self.p.datetime.now(self.p._TZ)
+        last = (now - self.p.timedelta(seconds=60)).isoformat()
+        d = self.p.decide(last_activity_at=last, now=now,
+                          last_proactive_at=(now - self.p.timedelta(seconds=600)).isoformat(),
+                          user_turns_since_proactive=1)
+        self.assertFalse(d.due)
+        self.assertIn('解锁下一次', d.reason)
+
+    def test_cooldown_blocks_rapid_refire(self):
+        now = self.p.datetime.now(self.p._TZ)
+        last = (now - self.p.timedelta(seconds=30)).isoformat()
+        d = self.p.decide(last_activity_at=last, now=now,
+                          last_proactive_at=(now - self.p.timedelta(seconds=5)).isoformat(),
+                          user_turns_since_proactive=99)
+        self.assertFalse(d.due)
+        self.assertIn('冷却', d.reason)
+
+    def test_no_activity_record(self):
+        self.assertFalse(self.p.decide(last_activity_at=None).due)
+
+    def test_forbidden_phrases_are_nonempty(self):
+        """查岗句式清单不能为空，否则措辞防线就是空的。"""
+        self.assertTrue(self.p.FORBIDDEN_PATTERNS)
+        self.assertIn('你在干嘛', self.p.FORBIDDEN_PATTERNS)
+        self.assertIn('你怎么不说话', self.p.FORBIDDEN_PATTERNS)
+
+    def test_instruction_forbids_nagging(self):
+        """主动开口的提示词里必须有禁止催问的段落。
+
+        这是整个功能最要紧的一处：产品是视频按分钟计费，冷场必须由她打破，
+        但措辞一旦滑向「你怎么不说话了」，陪伴感立刻变成压迫感。
+        """
+        from language_core import compiler, persona
+        text = compiler.proactive_instruction(persona.load_character('elise'),
+                                               persona.load_scene('cafe'), 'bored')
+        self.assertIn('绝对不要说', text)
+        self.assertIn('不要问对方为什么不说话', text)
+        self.assertIn('等待框架', text)
+        # 人设里写的禁句也要真的进提示词
+        for phrase in persona.load_character('elise').raw['proactive_style']['forbidden']:
+            self.assertIn(phrase, text)
+
+    def test_every_character_has_three_styles(self):
+        for cid in persona.all_character_ids():
+            styles = persona.load_character(cid).raw.get('proactive_style', {})
+            for kind in ('bored', 'noticing', 'inviting'):
+                self.assertTrue(styles.get(kind), f'{cid} 缺 {kind} 的开口方式')
+            self.assertTrue(styles.get('forbidden'), f'{cid} 缺禁止句式')
+
+    def test_every_scene_has_activity_pool(self):
+        for sid in persona.all_scene_ids():
+            self.assertTrue(persona.load_scene(sid).activity_pool, f'{sid} 缺 activity_pool')
+
+    def test_pick_kind_avoids_repeating_last(self):
+        from language_core import persona
+        char = persona.load_character('elise')
+        scene = persona.load_scene('amusement')
+        stall = self.p.StallSignal(idle_seconds=20, last_user_text='嗯', prev_user_text='哦')
+        for seed in range(12):
+            kind = self.p.pick_kind(scene=scene, char=char, stall=stall,
+                                    last_kind='bored', seed=seed)
+            self.assertNotEqual(kind, 'bored')
+
+    def test_proactive_turn_has_no_user_message(self):
+        """主动开口那一轮不能凭空造一条用户消息出来。
+
+        注意：离线 mock 的固定回复偶尔会和主动开口的候选句撞车，
+        此时守卫会判断「重复」而放弃本轮——这是设计行为，不是失败。
+        真实模型不会这么巧，所以这里两种结果都接受。
+        """
+        model = RecordingModel()
+        eng = Engine(store=MemoryStore(':memory:'), llm=model)
+        try:
+            eng.respond(user_id='u', character_id='elise', scene_id='cafe', message='你好')
+            before = eng.store.message_count('u', 'elise')
+            try:
+                eng.proactive(user_id='u', character_id='elise', scene_id='cafe', kind='bored')
+            except RuntimeError as e:
+                self.assertIn('重复', str(e))
+                # 放弃本轮 → 不应该留下任何消息
+                self.assertEqual(eng.store.message_count('u', 'elise'), before)
+                return
+            # 正常发出 → 只多了一条（她自己的），没有多出用户消息
+            self.assertEqual(eng.store.message_count('u', 'elise'), before + 1)
+            self.assertTrue(eng.store.last_proactive_at('u', 'elise'))
+        finally:
+            eng.shutdown()
+
+    def test_proactive_turn_has_no_user_role_message(self):
+        """消息表里不能出现空的用户消息。"""
+        model = RecordingModel()
+        eng = Engine(store=MemoryStore(':memory:'), llm=model)
+        try:
+            eng.proactive(user_id='u', character_id='elise', scene_id='cafe', kind='noticing')
+            turns = eng.store.recent_turns('u', 'elise', 20)
+            self.assertFalse([t for t in turns if t.role == 'user'])
+        finally:
+            eng.shutdown()
+
+    def test_context_marks_proactive_and_ends_with_system(self):
+        from language_core import compiler, persona
+        from language_core.memory import RecallResult
+        ctx = compiler.compile_context(
+            char=persona.load_character('elise'), scene=persona.load_scene('cafe'),
+            stage=persona.STAGES[0], recall=RecallResult(), user_message='',
+            proactive='bored')
+        self.assertTrue(ctx.proactive)
+        self.assertEqual(ctx.messages()[-1]['role'], 'system')
+
+    def test_normal_turn_still_ends_with_user(self):
+        from language_core import compiler, persona
+        from language_core.memory import RecallResult
+        ctx = compiler.compile_context(
+            char=persona.load_character('elise'), scene=persona.load_scene('cafe'),
+            stage=persona.STAGES[0], recall=RecallResult(), user_message='你好')
+        self.assertFalse(ctx.proactive)
+        self.assertEqual(ctx.messages()[-1]['role'], 'user')
+
+
 class StoreTests(unittest.TestCase):
     def test_session_and_feedback_ownership(self):
         s=ConversationStore(':memory:')

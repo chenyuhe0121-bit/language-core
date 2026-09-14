@@ -7,6 +7,7 @@ from typing import Any
 from . import config
 from .memory import RecallResult
 from .persona import Character, Scene, Stage
+from .proactive import FORBIDDEN_PATTERNS
 
 PROMPT_VERSION = 'conversation/2'
 CORE = '''你在与用户进行实时语音交流。成为给定的角色，直接说出这一刻你会对对方说的话。
@@ -43,8 +44,19 @@ class CompiledContext:
     budget: BudgetReport
     debug: dict[str, Any] = field(default_factory=dict)
     history: list[dict[str, str]] = field(default_factory=list)
+    proactive: bool = False
+
     def messages(self):
-        return [{'role': 'system', 'content': self.system}, *self.history, {'role': 'user', 'content': self.user}]
+        """发给模型的消息序列。
+
+        主动开口那一轮没有用户输入，所以末尾放一条 system 指令
+        （历史以她自己的话结尾，模型需要知道「现在该你起头」）。
+        """
+        if self.proactive:
+            tail = [{'role': 'system', 'content': self.user}]
+        else:
+            tail = [{'role': 'user', 'content': self.user}]
+        return [{'role': 'system', 'content': self.system}, *self.history, *tail]
 
 def user_said_farewell(message):
     return bool(re.fullmatch(r'\s*(?:那[我就]*|好[的吧]?[,， ]*)?(?:晚安|拜拜|再见|先这样|明天聊|回头聊|我?先走了|我要睡了|不聊了)[呀啦啊吧哦～~。！!，,\s]*', message or ''))
@@ -112,7 +124,104 @@ def resolve_params(intent, stage, scene, policy='must'):
     if intent == 'crisis': params['temperature'] = 0.6
     return params
 
-def compile_context(*, char, scene, stage, recall, user_message, intent=None, turn_count=0, last_reply_was_silence=False, extra_system=''):
+
+def proactive_instruction(char, scene, kind, seed=0, strict=False):
+    """主动开口要说什么，以及绝对不要说什么。
+
+    这是整个功能里最需要克制的一段。产品是视频按分钟计费，
+    所以冷场必须由她打破；但一旦措辞滑向「你怎么不说话了」，
+    陪伴感立刻变成压迫感。所以话题来源被限死在两处：
+    她自己此刻的状态，和她此刻注意到的东西。
+
+    strict=True 用于第一次生成不合格后的重试，把约束说得更死。
+    """
+    styles = dict(char.raw.get('proactive_style', {}) or {})
+    how = styles.get(kind, '') or styles.get('bored', '')
+    forbidden = list(styles.get('forbidden', [])) + list(FORBIDDEN_PATTERNS)
+    activities = list(scene.activity_pool or [])
+    note = scene.activity_note()
+
+    guide = {
+        'bored': '说你自己此刻的状态：在做什么、有点困、走神了、手上这个东西怎么样。'
+                 '不要抱怨无聊，也不要评价对方为什么不说话。',
+        'noticing': '说你此刻注意到的关于对方的一个具体细节——他的动作、神态，'
+                    '或者他刚刚做过的什么。只说看到的，不追问原因。',
+        'inviting': '提议一件现在就能一起做的事，用邀请的语气，给对方留退路。'
+                    '不推销，被拒绝也不解释。',
+    }.get(kind, '说你自己此刻的状态。')
+
+    # 对照示例。只有抽象要求时，模型会滑回「体贴地回应上一句」，
+    # 这是实测出来的——它把上下文里的疲惫读成了需要被照顾的信号。
+    sample = {
+        'bored': '像这样：「我把这杯冰的转了半天，冰都化没了。」\n'
+                 '反例（不要这样）：「累了就多坐会儿吧。」——这是在回应他，不是起头。',
+        'noticing': '像这样：「你刚才把杯子转了半圈。」\n'
+                    '反例（不要这样）：「我帮你把杯子挪过来点。」——这是接着演，不是起头。',
+        'inviting': '像这样：「套圈那摊子人散了，去试试？」\n'
+                    '反例（不要这样）：「那就不折腾了，先坐会儿。」——这是顺着他，不是起头。',
+    }.get(kind, '')
+
+    lines = [
+        '# 现在轮到你开口',
+        '**这一段的优先级高于前面所有关于「回应对方」的要求。**',
+        '前面说「先理解对方想表达什么再反应」——这一轮不适用，因为对方什么都没说。',
+        '',
+        '你应该起一个和刚才内容无关的新话头。不要承接上文，不要往下演，',
+        '不要安慰他、照顾他、替他做决定。',
+        '',
+        '## 这一轮只能做三件事之一',
+        '1. 说你自己此刻在做什么、什么状态',
+        '2. 说一个你此刻看到的具体细节',
+        '3. 提议一件现在就可以一起做的事',
+        '',
+        f'## 这一次用方式 {["", "1", "2", "3"][{"bored": 1, "noticing": 2, "inviting": 3}.get(kind, 1)]}\n{guide}',
+    ]
+    if sample:
+        lines += ['', sample]
+    if how:
+        lines += ['', f'按你的性格，你会这样：{how}']
+    if kind == 'inviting' and activities:
+        lines += ['', '这一场里可以拿来发起的事（挑一件，别全说）：']
+        lines += [f'- {a}' for a in activities]
+        if note:
+            lines.append(f'注意：{note}')
+
+    lines += [
+        '',
+        '## 绝对不要说',
+        '- 不要以「原来是这样」「那挺好的」「听起来」这类承接上文的说法开头',
+        '- 不要问对方为什么不说话、在不在、在忙什么',
+        '- 不要说「我等你很久了」「好久没回」这类等待框架',
+        '- 不要连问两个问题',
+        '- 不要复述你刚才说过的话',
+    ]
+    if strict:
+        lines += [
+            '',
+            '## 特别注意（刚才那次没做到）',
+            '- 只发一段，不要用 [sep] 分段。',
+            '- 全程不超过 40 个字。',
+            '- 不要以问号结尾。这一轮不是提问，是随口起个头。',
+        ]
+    if forbidden:
+        lines.append('- 这些说法一律不要出现：' + '、'.join(dict.fromkeys(forbidden)))
+    lines += [
+        '',
+        '## 长度与形状',
+        '**只发一段，不超过 40 字。** 这一轮是随口起个头，不是讲故事。',
+        '不要用 [sep] 分段。不要以问号结尾。不要罗列好几件事。',
+        '可以塞一个很短的括弧动作进同一段。',
+    ]
+    return '\n'.join(lines)
+
+def compile_context(*, char, scene, stage, recall, user_message, intent=None, turn_count=0,
+                    last_reply_was_silence=False, extra_system='',
+                    proactive=None, proactive_seed=0, proactive_strict=False):
+    """拼出这一轮的上下文。
+
+    proactive 非空时是「她主动开口」的一轮：没有用户输入，
+    历史以她自己的话结尾，末尾插一条指令告诉模型该她起头了。
+    """
     policy, reasons = decide_speak_policy(scene=scene, user_message=user_message, intent=intent, turn_count=turn_count)
     examples = char.raw.get('examples', [])
     example_text = '口吻示例（独立虚构片段，不属于当前聊天；学习反应方式，不照抄）：\n' + json.dumps(examples, ensure_ascii=False) if examples else ''
@@ -120,12 +229,25 @@ def compile_context(*, char, scene, stage, recall, user_message, intent=None, tu
               'scene': render_scene(scene), 'card_scenario': ('角色卡背景情境（当前场景优先）：' + str(char.raw.get('scenario', ''))) if char.raw.get('scenario') else '', 'examples': example_text, 'memory': render_memory(recall),
               'format_rules': output_format_rules(scene, stage, char, policy)}
     if extra_system: blocks = {'priority': extra_system, **blocks}
+    if proactive:
+        # 主动开口必须放在 system 最末尾。
+        # 放中间会被后面的格式规则和记忆盖过去，模型会当成「继续刚才的剧情」
+        # 而不是「起一个新话头」——实测过，两种方式的边界会守不住。
+        blocks = {**blocks, 'proactive': proactive_instruction(char, scene, proactive, proactive_seed, proactive_strict)}
     report = BudgetReport(used={k: len(v) for k, v in blocks.items()})
     system = '\n\n'.join(v for v in blocks.values() if v)
     system = system.replace('{{char}}', char.name).replace('{{user}}', '对方')
     if len(system) + len(user_message) > config.MAX_CONTEXT_CHARS:
         raise ValueError('角色与场景内容超出上下文预算，请缩短角色卡；系统没有静默截断。')
     history = [{'role': t.role, 'content': (t.context_content or t.content or '（安静地陪着）')} for t in recall.recent if t.role in ('user', 'assistant')]
+    if proactive:
+        # 主动开口这一轮，把历史末尾她那句没被回应的台词剪掉。
+        #
+        # 实测过：留着它，模型会把「用户没回」读成默许，于是接着说
+        # 「好。那我去买」——变成继续演刚才的剧情，而不是起一个新话头。
+        # 历史停在用户那一句，她才没有「接着往下演」的抓手。
+        while history and history[-1]['role'] != 'user':
+            history.pop()
     allowance = min(config.BUDGET['recent'], config.MAX_CONTEXT_CHARS - len(system) - len(user_message))
     while history and sum(len(m['content']) for m in history) > allowance:
         history.pop(0)
@@ -137,5 +259,7 @@ def compile_context(*, char, scene, stage, recall, user_message, intent=None, tu
              'speak_policy': policy, 'policy_reasons': reasons, 'scene_progressed': False, 'turn_count': turn_count,
              'recalled_memory_ids': [m.id for m in recall.memories], 'recalled_memory_preview': [m.content for m in recall.memories],
              'open_loops': [l.topic for l in recall.open_loops], 'has_summary': bool(recall.summary), 'recent_count': len(history),
-             'allowed_expressions': scene.allowed_expressions(), 'intensity_cap': 1.0, 'max_segments': 6}
-    return CompiledContext(system, user_message, resolve_params(intent, stage, scene, policy), report, debug, history)
+             'allowed_expressions': scene.allowed_expressions(), 'intensity_cap': 1.0, 'max_segments': 6,
+             'proactive': proactive or None}
+    return CompiledContext(system, user_message, resolve_params(intent, stage, scene, policy), report,
+                           debug, history, bool(proactive))

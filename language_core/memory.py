@@ -164,7 +164,9 @@ CREATE TABLE IF NOT EXISTS message (
     content      TEXT NOT NULL,
     spoken       INTEGER NOT NULL DEFAULT 1,
     seg_count    INTEGER NOT NULL DEFAULT 1,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    context_content TEXT NOT NULL DEFAULT '',
+    proactive    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_message_lookup ON message(user_id, character_id, id);
 
@@ -229,6 +231,7 @@ class MemoryStore:
                 "spoken": "INTEGER NOT NULL DEFAULT 1",
                 "seg_count": "INTEGER NOT NULL DEFAULT 1",
                 "context_content": "TEXT NOT NULL DEFAULT ''",
+                "proactive": "INTEGER NOT NULL DEFAULT 0",
             },
         }
         for table, columns in wanted.items():
@@ -266,17 +269,30 @@ class MemoryStore:
 
     def add_message(self, user_id: str, character_id: str, role: str, content: str,
                     scene_id: str | None = None, spoken: bool = True,
-                    seg_count: int = 1, context_content: str = "") -> str:
+                    seg_count: int = 1, context_content: str = "",
+                    proactive: bool = False) -> str:
         mid = f"m_{uuid.uuid4().hex[:12]}"
         with self._lock:
             self._conn.execute(
-                "INSERT INTO message(id, user_id, character_id, scene_id, role, content, spoken, seg_count, created_at, context_content) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO message(id, user_id, character_id, scene_id, role, content, "
+                "spoken, seg_count, created_at, context_content, proactive) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (mid, user_id, character_id, scene_id, role, content,
-                 1 if spoken else 0, int(seg_count), _now(), context_content),
+                 1 if spoken else 0, int(seg_count), _now(), context_content,
+                 1 if proactive else 0),
             )
             self._conn.commit()
         return mid
+
+    def last_assistant_text(self, user_id: str, character_id: str) -> str:
+        """她上一次说的话（含台词部分），用于防止主动开口重复上一条。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content FROM message WHERE user_id=? AND character_id=? AND role='assistant' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (user_id, character_id),
+            ).fetchone()
+        return (row["content"] or "") if row else ""
 
     def last_assistant_was_silent(self, user_id: str, character_id: str) -> bool:
         """上一轮她是不是只给了动作、没有台词。
@@ -322,6 +338,75 @@ class MemoryStore:
                 (user_id, character_id),
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    # ---- 主动开口用的活动追踪 ----
+    # 判断「对话是不是卡住了」需要知道三件事：最后一次活动是什么时候、
+    # 上一次她主动开口是什么时候、那次之后用户有没有搭理。
+    # 都从消息表推，不额外建表——避免又多一处要同步的状态。
+
+    def last_activity_at(self, user_id: str, character_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT created_at FROM message WHERE user_id=? AND character_id=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (user_id, character_id),
+            ).fetchone()
+        return row["created_at"] if row else None
+
+    def last_two_user_messages(self, user_id: str, character_id: str) -> list[str]:
+        """最近两条用户消息，按时间正序。用来判断用户是不是在敷衍。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT content FROM message WHERE user_id=? AND character_id=? AND role='user' "
+                "ORDER BY rowid DESC LIMIT 2",
+                (user_id, character_id),
+            ).fetchall()
+        return [r["content"] for r in reversed(rows)]
+
+    def last_proactive_at(self, user_id: str, character_id: str) -> str | None:
+        """上一次由她主动开口（而非回复用户）是什么时候。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT created_at FROM message WHERE user_id=? AND character_id=? "
+                "AND role='assistant' AND proactive=1 ORDER BY rowid DESC LIMIT 1",
+                (user_id, character_id),
+            ).fetchone()
+        return row["created_at"] if row else None
+
+    def user_messages_since_proactive(self, user_id: str, character_id: str) -> int:
+        """上一次主动开口之后，用户说了几句话。
+
+        没有任何主动记录时返回一个很大的数（第一次开口不受此限）。
+        用来实现「一个死胡同只开口一次」：用户只回一句「嗯」不解锁下一次，
+        否则就成了陪着用户一起敷衍，白烧他的钱。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, proactive FROM message WHERE user_id=? AND character_id=? "
+                "ORDER BY rowid DESC LIMIT 40",
+                (user_id, character_id),
+            ).fetchall()
+        n = 0
+        for r in rows:
+            if r["role"] == "assistant" and r["proactive"]:
+                return n
+            if r["role"] == "user":
+                n += 1
+        return 99
+
+    def last_proactive_context(self, user_id: str, character_id: str) -> str:
+        """上一次主动开口用的旁白，里面带着当时选的方式（kind）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT context_content FROM message WHERE user_id=? AND character_id=? "
+                "AND role='assistant' AND proactive=1 ORDER BY rowid DESC LIMIT 1",
+                (user_id, character_id),
+            ).fetchone()
+        return (row["context_content"] or "") if row else ""
+
+    def answered_since_proactive(self, user_id: str, character_id: str) -> bool:
+        """兼容旧调用：用户是否已回够两句。"""
+        return self.user_messages_since_proactive(user_id, character_id) >= config.PROACTIVE_MIN_USER_TURNS
 
     # ---- 短期摘要 ----
 

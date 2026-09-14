@@ -76,6 +76,127 @@ class TurnResult:
 # ---------------------------------------------------------------- 引擎
 
 
+# ---------------------------------------------------------------- 工具
+
+
+def _serialize_context(turn) -> str:
+    """把一轮回复还原成带旁白的行协议，供下一轮回放。
+
+    历史里如果只存纯台词，她会丢掉自己上一轮的情绪和语速；
+    下次开口时状态就接不上。
+    """
+    parts = []
+    for s in turn.segments:
+        head = '@seg type=' + s.type
+        if s.narration:
+            n = s.narration
+            if n.emotion:
+                head += ' emotion=' + n.emotion[0].name + ':' + str(n.emotion[0].intensity)
+            head += ' pace=' + (n.pace or 'normal')
+            if n.expression:
+                head += ' expr=' + ','.join(n.expression)
+        parts.append(head + '\n' + (s.text or ''))
+    return '\n[sep]\n'.join(parts)
+
+
+PROACTIVE_MAX_CHARS = 40
+PROACTIVE_MAX_CONTAINMENT = 0.65
+
+
+def _bigrams(text: str) -> set[str]:
+    t = "".join(ch for ch in (text or "") if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    return {t[i:i + 2] for i in range(len(t) - 1)} or ({t} if t else set())
+
+
+def _containment(a: str, b: str) -> float:
+    """a 有多少比例的内容也出现在 b 里。
+
+    用包含度而不是 Jaccard 相似度：同一个话题里换句话说是正常的
+    （她刚说完画画，接着还提画画不算重复），但如果新说的这句
+    几乎整句都能在上一条里找到，那就是把上一条又说了一遍。
+    """
+    ga, gb = _bigrams(a), _bigrams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga)
+
+
+def _proactive_violations(turn, previous: str) -> tuple[bool, list[str]]:
+    """主动开口的硬约束。返回 (是否不合格, 原因)。
+
+    一段、不超过 40 字、不以问号结尾——这三条是产品要求：
+    用户在按分钟付费，起个头不该长篇大论，也不该变成提问。
+    与上一条重复那一条是实测踩出来的：模型会把上一轮说过的话
+    稍微改改再说一遍，用户看到的是「她怎么又说了一遍」。
+    """
+    problems: list[str] = []
+    text = (turn.dialogue or "").strip()
+
+    if not text:
+        problems.append('没有台词')
+    if len(turn.segments) > 1:
+        problems.append(f'{len(turn.segments)} 段，只该发一段')
+    if len(text) > PROACTIVE_MAX_CHARS:
+        problems.append(f'{len(text)} 字，超过 {PROACTIVE_MAX_CHARS}')
+    if text.endswith(('？', '?')):
+        problems.append('以问号结尾，这一轮不该提问')
+    if previous and _containment(text, previous) > PROACTIVE_MAX_CONTAINMENT:
+        problems.append('新说的几乎整句都在上一条里，等于重复')
+    return bool(problems), problems
+
+
+def _trim_proactive(turn, previous: str):
+    """重试仍不合格时的兜底：压到一段、只留第一句、去掉问句。
+
+    宁可短，宁可少说一句，也不能让她在用户付费的时间里重复自己。
+    """
+    parts = [s for s in turn.segments if s.spoken and (s.text or '').strip()]
+    keep = parts[0] if parts else None
+    if keep is None:
+        return turn
+
+    text = (keep.text or '').strip()
+
+    # 先只留第一句。硬截断会留下半句话，读起来更像出错。
+    import re as _re
+    sentences = [s for s in _re.split(r'(?<=[。！!？?])', text) if s.strip()]
+    if sentences:
+        text = sentences[0].strip()
+
+    text = text.rstrip()
+    while text.endswith(('？', '?')):
+        text = text[:-1].rstrip('，,、 ')
+
+    if len(text) > PROACTIVE_MAX_CHARS:
+        cut = text[:PROACTIVE_MAX_CHARS]
+        # 优先切在句号上，退而求其次切在逗号，都没有就切在最后一个整字
+        for marks in (('。', '！', '!'), ('，', '；', ';', '、')):
+            pos = max((cut.rfind(m) for m in marks), default=-1)
+            if pos >= PROACTIVE_MAX_CHARS // 2:
+                cut = cut[:pos + 1]
+                break
+        else:
+            cut = cut.rstrip('，,、；; ')
+        text = cut.rstrip()
+        if not text.endswith(('。', '！', '!', '，', '、', '；')):
+            text += '。'
+
+    if previous and _containment(text, previous) > PROACTIVE_MAX_CONTAINMENT:
+        # 重试过还是重复，说明这次起头失败了。
+        # 与其让她在用户付费的时间里重复自己，不如这一轮闭嘴——
+        # 调用方按「没有产生台词」处理，等下一个静默周期再说。
+        raise RuntimeError('主动开口与上一条重复，本轮放弃')
+
+    if text and not text.endswith(('。', '！', '!', '…')):
+        text += '。'
+
+    turn.segments = [s for s in turn.segments if s is keep]
+    keep.text = text
+    for i, s in enumerate(turn.segments):
+        s.index = i
+    return turn
+
+
 class Engine:
     def __init__(self, store: MemoryStore | None = None, llm: Any | None = None):
         self.store = store or MemoryStore()
@@ -167,18 +288,82 @@ class Engine:
             user_id, character_id, "assistant", turn.dialogue, scene_id,
             spoken=bool(turn.dialogue.strip()),
             seg_count=len(turn.segments),
-            context_content='\n[sep]\n'.join(
-                '@seg type=' + s.type +
-                (' emotion=' + s.narration.emotion[0].name + ':' + str(s.narration.emotion[0].intensity) if s.narration and s.narration.emotion else '') +
-                (' pace=' + (s.narration.pace or 'normal') if s.narration else '') +
-                (' expr=' + ','.join(s.narration.expression) if s.narration and s.narration.expression else '') +
-                '\n' + (s.text or '') for s in turn.segments),
+            context_content=_serialize_context(turn),
         )
         self.writer.submit(user_id, character_id, message, scene_id, turn.turn_id,
                            extracted=extracted)
         if use_memory:
             self._maybe_compress_summary(user_id, character_id)
         self.store.mark_open_loops_asked(user_id, character_id)
+
+        return TurnResult(turn=turn, context=ctx, checks=checks,
+                          regenerated=regen, error=error)
+
+    def proactive(self, *, user_id: str, character_id: str, scene_id: str,
+                  kind: str, seed: int = 0, use_memory: bool = False,
+                  on_segment: Any = None, cancelled: Any = None) -> TurnResult:
+        """她主动开口的一轮。没有用户输入。
+
+        与 respond 的区别：
+          - 不做分流（没有用户消息可分类）
+          - 不写用户消息
+          - 提示词里多一段主动开口指令，明确禁止催问句式
+          - 落库时打上 proactive 标记，供「一个死胡同只开口一次」的判断使用
+          - 生成后过三道硬约束：一段、不超过 40 字、不能重复上一条
+
+        三道约束里前两道是产品要求（用户在按分钟付费，起个头不该长篇大论），
+        第三道是实测踩出来的：模型会把上一轮说过的话稍微改改再说一遍，
+        用户看到的是"她怎么又说了一遍"。
+        """
+        char = load_character(character_id)
+        scene = load_scene(scene_id)
+        rel = self.relationship(user_id, character_id)
+        stage = rel["stage"]
+        previous = self.store.last_assistant_text(user_id, character_id)
+        turn_count = self.store.message_count(user_id, character_id) // 2
+
+        def build(strict: bool) -> CompiledContext:
+            recall = self.store.recall_all(user_id, character_id, "", scene_id) if use_memory else RecallResult(
+                profile=self.store.get_profile(user_id, character_id),
+                recent=self.store.recent_turns(user_id, character_id, config.RECENT_TURNS))
+            return compile_context(
+                char=char, scene=scene, stage=stage, recall=recall,
+                user_message="", intent="proactive", turn_count=turn_count,
+                proactive=kind, proactive_seed=seed, proactive_strict=strict,
+            )
+
+        ctx = build(False)
+        turn, checks, regen, error = self._generate_and_check(
+            ctx=ctx, scene=scene, stage=stage, char=char, recall=RecallResult(),
+            allow_regenerate=True, on_segment=on_segment, cancelled=cancelled,
+        )
+
+        # 不合格就带上更严的约束重来一次
+        if _proactive_violations(turn, previous)[0]:
+            if on_segment is not None:
+                raise RuntimeError('主动开口不合格，已重试') from None
+            strict_ctx = build(True)
+            retry, checks2, regen2, error2 = self._generate_and_check(
+                ctx=strict_ctx, scene=scene, stage=stage, char=char, recall=RecallResult(),
+                allow_regenerate=True, on_segment=None, cancelled=cancelled,
+            )
+            if not _proactive_violations(retry, previous)[0]:
+                ctx, turn, checks, regen, error = strict_ctx, retry, checks2, regen2 + 1, error2
+            else:
+                turn = _trim_proactive(retry, previous)
+                ctx = strict_ctx
+
+        if cancelled and cancelled():
+            raise RuntimeError('本轮已停止')
+
+        if not turn.dialogue.strip():
+            raise RuntimeError('主动开口没有产生台词')
+
+        self.store.add_message(
+            user_id, character_id, "assistant", turn.dialogue, scene_id,
+            spoken=True, seg_count=len(turn.segments),
+            context_content=_serialize_context(turn), proactive=True,
+        )
 
         return TurnResult(turn=turn, context=ctx, checks=checks,
                           regenerated=regen, error=error)

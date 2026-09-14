@@ -3,6 +3,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let importedScenario='',requestId=null;
 let characters=[],scenes=[],sessions=[],state=null,current=null,busy=false,controller=null,voice=false,feedbackTurn=null,lastDebug=null;
+let idleTimer=null,lastTypedAt=0,proactiveBusy=false;
 const moods={neutral:'平静',happy:'开心',concern:'关切',sad:'难过',playful:'俏皮',shy:'害羞',annoyed:'不悦',surprised:'惊讶'};
 const paces={slow:'慢',normal:'自然',fast:'快',very_slow:'很慢',very_fast:'很快'};
 const intents={comfort:'安慰',tease:'打趣',probe:'追问',share:'分享',invite:'邀请',deflect:'岔开',refuse:'拒绝',agree:'应下',reminisce:'忆旧',idle:'随口'};
@@ -18,12 +19,12 @@ function renderSessions(){const box=$('sessions');box.replaceChildren();sessions
 async function refreshSessions(){sessions=(await api('/api/sessions')).sessions;renderSessions();}
 function renderState(){const c=state.character;$('character-name').textContent=c.name;$('character-tagline').textContent=c.tagline;avatar($('header-avatar'),c);$('scene').value=state.scene.id;$('relationship').value=String([0,10,20,30,40].filter(v=>v<=state.intimacy).pop()||0);$('memory-enabled').checked=!!state.session?.use_memory;$('model-status').textContent=state.mode==='live'?state.model:'离线演示 · 非真实对话';renderCharacters();renderSessions();}
 async function openSession(id){if(busy)return;current=id;localStorage.setItem('muse-session',id);state=await api('/api/state'+qs());renderState();$('messages').replaceChildren();lastDebug=null;$('debug').innerHTML='<p class="muted">选择一条回复的“详情”，或发一条新消息。</p>';
- if(state.records.length){state.records.forEach(record=>{userTurn(record.user_text);const wrap=assistantTurn();record.payload.reply.segments.forEach(s=>appendSegment(wrap,s));finishTurn(wrap,record.payload,record.feedback);});}
+ if(state.records.length){state.records.forEach(record=>{if(record.user_text&&record.user_text!=='（她主动开口）')userTurn(record.user_text);const wrap=assistantTurn(record.payload?.debug?.context?.proactive);record.payload.reply.segments.forEach(s=>appendSegment(wrap,s));finishTurn(wrap,record.payload,record.feedback);});}
  else{const welcome=document.createElement('div');welcome.className='welcome';welcome.innerHTML=`<div class="avatar"></div><h2>和 ${esc(state.character.name)} 聊一会儿</h2><p>${esc(state.character.tagline)}。从此刻想到的一件小事开始。</p>`;avatar(welcome.firstElementChild,state.character);$('messages').append(welcome);if(state.character.greeting){const w=assistantTurn();appendSegment(w,{spoken:true,text:state.character.greeting});}}
- notice(state.mode==='mock'?'当前是离线管道演示，不能用来评判角色质量。':'');$('sidebar').classList.remove('open');await loadMemory();scroll();$('input').focus();}
+ notice(state.mode==='mock'?'当前是离线管道演示，不能用来评判角色质量。':'');$('sidebar').classList.remove('open');await loadMemory();scroll();$('input').focus();armIdleTimer();}
 async function newChat(characterId=state?.character.id||'elise'){if(busy)return;const {session}=await api('/api/sessions',{character_id:characterId,scene_id:$('scene').value||'cafe'});await refreshSessions();await openSession(session.id);}
 function userTurn(text){const w=document.createElement('div');w.className='turn user';w.innerHTML=`<div class="speaker">你</div><div class="bubble">${esc(text)}</div>`;$('messages').append(w);scroll();return w;}
-function assistantTurn(){const w=document.createElement('div');w.className='turn assistant';w.innerHTML=`<div class="speaker">${esc(state.character.name)}</div>`;$('messages').append(w);return w;}
+function assistantTurn(proactive){const w=document.createElement('div');w.className='turn assistant'+(proactive?' proactive':'');w.innerHTML=`<div class="speaker">${esc(state.character.name)}${proactive?'<span class="self-start">她主动开口</span>':''}</div>`;$('messages').append(w);return w;}
 function appendSegment(w,s){
   const box=document.createElement('div');box.className='segment';
   const d=document.createElement('div');d.className=s.spoken?'bubble':'narration';d.textContent=s.text||'';
@@ -59,7 +60,7 @@ function finishTurn(w,payload,feedback={}){const d=payload.debug||{};const actio
 function debug(payload){lastDebug=payload;const d=payload.debug||{};const checks=d.checks||{};$('debug').innerHTML=`<h3>本轮表达</h3>${payload.reply.segments.map(s=>`<p>${esc(s.text)}</p><div>${(s.narration?.emotion||[]).map(e=>`<span class="badge">${esc(moods[e.name]||e.name)} ${e.intensity}</span>`).join('')}<span class="badge">${esc(paces[s.narration?.pace]||'自然')}</span>${(s.narration?.expression||[]).map(e=>`<span class="badge">${esc(e)}</span>`).join('')}</div>`).join('')}<h3>生成信息</h3><pre>${esc(JSON.stringify({model:payload.reply.meta?.model,prompt:d.context?.prompt_version,first_segment_ms:d.first_segment_ms,total_ms:d.latency_ms,history_messages:d.context?.recent_count,mode:d.mode,regenerated:d.regenerated},null,2))}</pre><h3>协议检查</h3><p>${checks.hard_fail?'未通过':'可解析'}${checks.warnings?.length?' · 有风格提示':''}</p><p class="muted">协议通过不等于对话质量通过；自然度与人设以你的体验为准。</p><details><summary>实际发送给模型的消息</summary><pre>${esc(JSON.stringify(d.messages||[],null,2))}</pre></details><details><summary>上下文使用量</summary><pre>${esc(JSON.stringify(d.budget,null,2))}</pre></details><details><summary>完整输出协议</summary><pre>${esc(JSON.stringify(payload.reply,null,2))}</pre></details>`;}
 async function loadMemory(){const data=await api('/api/memory'+qs());$('memory').innerHTML=data.memories.map(m=>`<p class="muted">${esc(m.content)}</p>`).join('')||'<p class="muted">当前会话暂无长期记忆。</p>';}
 async function settings(){if(busy)return;const out=await api('/api/session/settings',{session_id:current,scene_id:$('scene').value,intimacy:Number($('relationship').value),use_memory:$('memory-enabled').checked});state=out.state;renderState();notice('已更新当前对话的场景与关系。');}
-async function send(event){event?.preventDefault();if(busy||!current)return;const text=$('input').value.trim();if(!text)return;const submittedSession=current;setBusy(true);notice('');$('input').value='';$('input').style.height='auto';userTurn(text);const w=assistantTurn();const typing=document.createElement('div');typing.className='typing';typing.textContent='正在想怎么接你的话…';w.append(typing);scroll();controller=new AbortController();requestId=crypto.randomUUID();let complete=false,segments=0;
+async function send(event){event?.preventDefault();if(busy||!current)return;const text=$('input').value.trim();if(!text)return;lastTypedAt=Date.now();const submittedSession=current;setBusy(true);notice('');$('input').value='';$('input').style.height='auto';userTurn(text);const w=assistantTurn();const typing=document.createElement('div');typing.className='typing';typing.textContent='正在想怎么接你的话…';w.append(typing);scroll();controller=new AbortController();requestId=crypto.randomUUID();let complete=false,segments=0;
  try{const response=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:submittedSession,request_id:requestId,message:text}),signal:controller.signal});if(!response.ok){const e=await response.json();throw Error(e.error||'生成失败');}const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';
  const processEvent=block=>{let name='message',data='';for(const line of block.split('\n')){if(line.startsWith('event:'))name=line.slice(6).trim();if(line.startsWith('data:'))data+=line.slice(5).trim();}if(!data)return;const p=JSON.parse(data);if(name==='segment'){typing.remove();appendSegment(w,p);speak(p);segments++;$('generation-status').textContent='正在回应…';}if(name==='error')throw Error(p.error);if(name==='done'){typing.remove();if(!segments)p.reply.segments.forEach(s=>appendSegment(w,s));finishTurn(w,p);debug(p);complete=true;}};
  while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let pos;while((pos=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,pos);buffer=buffer.slice(pos+2);processEvent(block);}}
@@ -67,9 +68,50 @@ async function send(event){event?.preventDefault();if(busy||!current)return;cons
  }catch(e){typing.remove();if('speechSynthesis'in window)speechSynthesis.cancel();w.remove();notice(e.name==='AbortError'?'已停止，本轮不计入对话历史。':'未完成：'+e.message+' 输入已保留，可重试。',e.name!=='AbortError');if(!$('input').value)$('input').value=text;}
  finally{controller=null;setBusy(false);$('input').focus();scroll();}}
 async function guard(fn){try{await fn();}catch(e){notice(e.message,true);}}
+
+/* ── 主动开口 ──────────────────────────────────────────────
+   视频按分钟计费，冷场等于让用户白花钱。所以她会在对话卡住时起个头。
+   判断全在后端（刷新页面不会重置计时器），前端只负责问和渲染。
+   用户一有输入就暂时不问——那是他在打字，不是卡住。 */
+function armIdleTimer(){if(idleTimer)clearInterval(idleTimer);lastTypedAt=Date.now();idleTimer=setInterval(idleTick,3000);}
+function disarmIdleTimer(){if(idleTimer){clearInterval(idleTimer);idleTimer=null;}}
+async function idleTick(){
+  if(!current||busy||proactiveBusy)return;
+  if(Date.now()-lastTypedAt<8000)return;              // 用户刚刚有输入，别打断
+  if($('input').value.trim())return;                  // 输入框里有半句话，等他打完
+  let decision;
+  try{decision=await api('/api/idle'+qs());}catch{return;}
+  if(!decision.due||!decision.enabled)return;
+  proactiveBusy=true;
+  try{await speakUp(decision.kind||'bored');}
+  finally{proactiveBusy=false;lastTypedAt=Date.now();}
+}
+async function speakUp(kind){
+  const submittedSession=current;
+  setBusy(true);notice('');
+  const w=assistantTurn(true);
+  const typing=document.createElement('div');typing.className='typing';typing.textContent='她想说点什么…';w.append(typing);scroll();
+  controller=new AbortController();requestId=crypto.randomUUID();let complete=false,segments=0;
+  try{
+    const response=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:submittedSession,request_id:requestId,proactive:true,kind}),signal:controller.signal});
+    if(!response.ok){const e=await response.json();throw Error(e.error||'生成失败');}
+    const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';
+    const processEvent=block=>{let name='message',data='';for(const line of block.split('\n')){if(line.startsWith('event:'))name=line.slice(6).trim();if(line.startsWith('data:'))data+=line.slice(5).trim();}if(!data)return;const p=JSON.parse(data);if(name==='segment'){typing.remove();appendSegment(w,p);speak(p);segments++;}if(name==='error')throw Error(p.error);if(name==='done'){typing.remove();if(!segments)p.reply.segments.forEach(s=>appendSegment(w,s));finishTurn(w,p);debug(p);complete=true;}};
+    while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let pos;while((pos=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,pos);buffer=buffer.slice(pos+2);processEvent(block);}}
+    if(!complete){w.remove();return;}
+    notice('她看你这会儿没说话，自己起了个头。');
+    await refreshSessions();
+  }catch(e){
+    typing.remove();
+    if('speechSynthesis'in window)speechSynthesis.cancel();
+    w.remove();
+    // 主动开口失败不打扰用户，安静地等下一轮
+  }finally{controller=null;setBusy(false);scroll();}
+}
 $('composer').onsubmit=send;
 $('input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send();}};
-$('input').oninput=()=>{$('input').style.height='auto';$('input').style.height=Math.min($('input').scrollHeight,170)+'px';};
+$('input').oninput=()=>{lastTypedAt=Date.now();$('input').style.height='auto';$('input').style.height=Math.min($('input').scrollHeight,170)+'px';};
 $('stop').onclick=()=>{if(!controller)return;api('/api/chat/cancel',{session_id:current,request_id:requestId}).finally(()=>controller?.abort());};
 $('new-chat').onclick=()=>guard(()=>newChat());
 $('scene').onchange=()=>guard(settings);$('relationship').onchange=()=>guard(settings);$('memory-enabled').onchange=()=>guard(settings);

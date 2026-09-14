@@ -6,12 +6,31 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from . import config, persona
+from . import config, persona, proactive
 from .cards import public_card, save_card
 from .engine import Engine
 from .memory import ConversationStore
 
 WEB_DIR = config.ROOT / 'language_core' / 'web'
+
+_asset_stamps = {}
+
+
+def _asset_stamp(name):
+    """静态资源的内容指纹。文件一变，URL 就变，浏览器缓存自动失效。"""
+    path = WEB_DIR / name
+    try:
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return '0'
+    cached = _asset_stamps.get(name)
+    if cached and cached[0] == key:
+        return cached[1]
+    import hashlib
+    stamp = hashlib.sha1(path.read_bytes()).hexdigest()[:10]
+    _asset_stamps[name] = (key, stamp)
+    return stamp
 _engine_lock = threading.Lock()
 _engine = None
 _chat_lock = threading.Lock()
@@ -61,13 +80,54 @@ class Handler(BaseHTTPRequestHandler):
         profile = eng.store.get_profile(uid, cid)
         scene = persona.load_scene(profile.get('current_scene', config.DEFAULT_SCENE))
         rel = eng.relationship(uid, cid)
-        result = {'character': public_card(cid), 'scene': {'id': scene.id, 'name': scene.name, 'goal': scene.scene_goal.get('primary', '')},
-                  'stage': {'id': rel['stage'].id, 'name': rel['stage'].name}, 'intimacy': rel['intimacy'],
-                  'unlocked_scenes': list(persona.all_scene_ids()), 'mode': eng.llm.mode,
-                  'model': config.LLM_MODEL if eng.llm.mode == 'live' else 'mock',
-                  'recent': [x.to_dict() for x in eng.store.recent_turns(uid, cid, 60)],
-                  'session': convo, 'records': eng.store.replies(str(values.get('user_id') or 'local'), uid) if convo else []}
-        return result
+        return {'character': public_card(cid),
+                'scene': {'id': scene.id, 'name': scene.name, 'goal': scene.scene_goal.get('primary', '')},
+                'stage': {'id': rel['stage'].id, 'name': rel['stage'].name}, 'intimacy': rel['intimacy'],
+                'unlocked_scenes': list(persona.all_scene_ids()), 'mode': eng.llm.mode,
+                'model': config.LLM_MODEL if eng.llm.mode == 'live' else 'mock',
+                'recent': [x.to_dict() for x in eng.store.recent_turns(uid, cid, 60)],
+                'session': convo,
+                'records': eng.store.replies(str(values.get('user_id') or 'local'), uid) if convo else []}
+
+    def _idle(self, values):
+        """对话是不是卡住了，该不该由她主动开口。
+
+        只做判断，不改状态。真正的「我开口了」在生成那一轮才落库，
+        否则用户一刷新页面就会把额度用掉。
+        """
+        uid, cid, convo = self._identity(values)
+        if not config.PROACTIVE_ENABLED:
+            return {'due': False, 'reason': '主动开口已关闭', 'enabled': False}
+        eng = engine()
+        store = eng.store
+        with _active_lock:
+            generating = uid in _active
+        decision = proactive.decide(
+            last_activity_at=store.last_activity_at(uid, cid),
+            last_proactive_at=store.last_proactive_at(uid, cid),
+            user_turns_since_proactive=store.user_messages_since_proactive(uid, cid),
+            generating=generating,
+        )
+        # 挑一种开口方式。用消息数当种子，同一轮的结果稳定；
+        # 传入上一次用过的方式，避免连着两次用同一种。
+        if decision.due:
+            recent = store.last_two_user_messages(uid, cid)
+            stall = proactive.StallSignal(
+                idle_seconds=decision.idle_seconds,
+                last_user_text=recent[-1] if recent else '',
+                prev_user_text=recent[-2] if len(recent) > 1 else '',
+            )
+            decision.kind = proactive.pick_kind(
+                scene=persona.load_scene(store.get_profile(uid, cid).get('current_scene', config.DEFAULT_SCENE)),
+                char=persona.load_character(cid),
+                stall=stall,
+                last_kind=proactive.kind_from_history(store.last_proactive_context(uid, cid)),
+                seed=store.message_count(uid, cid),
+            )
+        out = decision.to_dict()
+        out['enabled'] = True
+        out['poll_seconds'] = config.PROACTIVE_POLL_SECONDS
+        return out
 
     def do_GET(self):
         try:
@@ -78,6 +138,14 @@ class Handler(BaseHTTPRequestHandler):
             if route in ('/', '/app.js', '/app.css'):
                 path = WEB_DIR / ('index.html' if route == '/' else route[1:])
                 raw = path.read_bytes()
+                if route == '/':
+                    # 给静态资源的引用带上内容指纹。
+                    # 不加这个，浏览器会一直用缓存里的旧 app.js——
+                    # 表现是「代码改了但页面行为没变」，排查起来很费时间。
+                    raw = raw.replace(b'/app.js',
+                                      ('/app.js?v=' + _asset_stamp('app.js')).encode()).replace(
+                                  b'/app.css',
+                                  ('/app.css?v=' + _asset_stamp('app.css')).encode())
                 self.send_response(200)
                 self.send_header('Content-Type', (mimetypes.guess_type(str(path))[0] or 'text/plain') + '; charset=utf-8')
                 self.send_header('Content-Length', str(len(raw)))
@@ -91,6 +159,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'scenes': [{'id': s, 'name': persona.load_scene(s).name} for s in persona.all_scene_ids()]})
             elif route == '/api/sessions':
                 self._send_json({'sessions': engine().store.conversations(owner)})
+            elif route == '/api/idle': self._send_json(self._idle(values))
             elif route == '/api/state': self._send_json(self._state(values))
             elif route in ('/api/memory', '/api/export'):
                 uid,cid,convo = self._identity(values)
@@ -148,7 +217,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({'ok':True,'state':self._state(body)}); return
             if route in ('/api/chat','/api/chat/stream'):
                 message=str(body.get('message') or '').strip()
-                if not message or len(message)>6000: raise ValueError('消息须为 1–6000 字')
+                # 主动开口那一轮没有用户输入，所以只有普通回合才要求非空
+                if not body.get('proactive') and (not message or len(message)>6000):
+                    raise ValueError('消息须为 1–6000 字')
                 scene_id=str(body.get('scene_id') or (convo or {}).get('scene_id') or engine().store.get_profile(uid,cid).get('current_scene',config.DEFAULT_SCENE))
                 persona.load_scene(scene_id)
                 if not _chat_lock.acquire(blocking=False):
@@ -170,14 +241,23 @@ class Handler(BaseHTTPRequestHandler):
                         nonlocal first
                         if first is None: first=time.perf_counter()-started
                         emit('segment',value)
-                    result=engine().respond(user_id=uid,character_id=cid,scene_id=scene_id,message=message,
-                        use_memory=bool((convo or {}).get('use_memory',False)),on_segment=segment if streaming else None,cancelled=cancel_event.is_set)
+                    if body.get('proactive'):
+                        # 主动开口：没有用户输入，由她起头
+                        result=engine().proactive(user_id=uid,character_id=cid,scene_id=scene_id,
+                            kind=str(body.get('kind') or 'bored'),seed=int(body.get('seed') or 0),
+                            use_memory=bool((convo or {}).get('use_memory',False)),
+                            on_segment=segment if streaming else None,cancelled=cancel_event.is_set)
+                    else:
+                        result=engine().respond(user_id=uid,character_id=cid,scene_id=scene_id,message=message,
+                            use_memory=bool((convo or {}).get('use_memory',False)),on_segment=segment if streaming else None,cancelled=cancel_event.is_set)
                     payload=result.to_dict()
                     payload['debug']['mode']=engine().llm.mode
                     payload['debug']['latency_ms']=round((time.perf_counter()-started)*1000)
                     payload['debug']['first_segment_ms']=round(first*1000) if first is not None else None
                     payload['debug']['messages']=result.context.messages()
-                    if convo: engine().store.save_reply(uid,message,payload)
+                    # 前端靠这个标记渲染「她主动开口」，落库也靠它参与计数
+                    payload['debug'].setdefault('context',{})['proactive']=result.context.proactive
+                    if convo: engine().store.save_reply(uid,message if message else '（她主动开口）',payload)
                     if streaming: emit('done',payload)
                     else: self._send_json(payload)
                 except (BrokenPipeError,ConnectionResetError): pass

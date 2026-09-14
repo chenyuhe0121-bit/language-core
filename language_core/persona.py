@@ -261,6 +261,18 @@ class Scene:
         return dict(self.raw.get("interaction_gate", {}))
 
     @property
+    def activity_pool(self) -> list[str]:
+        """这一场里她可以发起的行动。主动开口时从这里挑，不凭空编。"""
+        pool = self.raw.get("activity_pool", {})
+        if isinstance(pool, dict):
+            return list(pool.get("items", []))
+        return list(pool or [])
+
+    def activity_note(self) -> str:
+        pool = self.raw.get("activity_pool", {})
+        return str(pool.get("note", "")) if isinstance(pool, dict) else ""
+
+    @property
     def expression_map(self) -> dict[str, Any]:
         return dict(self.raw.get("expression_map", {}))
 
