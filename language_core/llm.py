@@ -83,6 +83,25 @@ def _topic_score(msg: str, when: tuple[str, ...]) -> int:
     return best if best >= 2 else 0
 
 
+def _first_clause(text: str) -> str:
+    """只留第一句。离线模式用它压短回复，模拟「只说一句」。"""
+    marks = "。！？!?…"
+    for i, ch in enumerate(text or ""):
+        if ch in marks:
+            return text[:i + 1]
+    return text or ""
+
+
+# 长回复时补的一句追问，让离线模式也能看出「她在展开」而不是只有一句
+_EXTRA_TAIL = {
+    "cafe": "你平时也这个点来吗？",
+    "park": "你走过这条路吗？",
+    "amusement": "你还想玩哪个？",
+    "living_room": "你最近睡得怎么样？",
+    "bedroom": "你今天累不累？",
+}
+
+
 # 首次见面的开场白，与再次见面的开场白分开
 _OPENINGS: dict[str, tuple[str, str]] = {
     "cafe": ("（把杯子擦干净放回架子上）欢迎光临。今天想喝点什么？",
@@ -592,15 +611,19 @@ class MockLLM:
                 ], attempt)
 
         # ---- 分支 8：上下文回复。按用户话里的关键词和场景选一句 ----
-        return self._wrap(self._contextual(msg, scene_id, stage_id, default_expr, emo), attempt)
+        return self._wrap(self._contextual(msg, scene_id, stage_id, default_expr, emo,
+                                           (context or {}).get("length_level", "short")), attempt)
 
     @staticmethod
     def _contextual(msg: str, scene_id: str, stage_id: str,
-                    default_expr: str, emo) -> list[str]:
+                    default_expr: str, emo, length_level: str = "short") -> list[str]:
         """在场景与关系阶段的约束下，挑一句接得上话的回复。
 
         这不是语言模型，是确定性兜底。它保证 mock 不会每轮都说同一句话，
         也让链路在没有真实模型时能演示出「记得上一句」的效果。
+
+        length_level 控制这一轮说多少：离线也要能看出长短参差，
+        否则「回复长度要有变化」这条在产品上根本验证不了。
         """
         table = _SCENE_TABLE.get(scene_id, _SCENE_TABLE["cafe"])
 
@@ -616,10 +639,26 @@ class MockLLM:
         if chosen is None:
             chosen = table["_default"]
 
-        # 关系阶段越浅，主动程度越低：初次相识只接话，熟悉之后才反问
         reply = chosen["reply"]
-        if chosen.get("ask") and stage_id != "first_meet":
-            reply = reply + chosen["ask"]
+        ask = chosen.get("ask") or ""
+
+        # 按档位决定说多少
+        if length_level == "terse":
+            reply = _first_clause(reply)
+            ask = ""
+        elif length_level == "short":
+            reply = _first_clause(reply)
+        elif length_level == "medium":
+            pass                      # 保留整句
+        else:                         # long：把追问也接上，显得在展开
+            if not ask:
+                ask = _EXTRA_TAIL.get(scene_id, "")
+
+        # 关系阶段越浅，主动程度越低：初次相识只接话，熟悉之后才反问
+        if ask and stage_id != "first_meet":
+            reply = reply + ask
+        elif ask and length_level == "long":
+            reply = reply + ask
 
         expr = chosen.get("expr") or default_expr
         emotion = chosen.get("emotion", "neutral")

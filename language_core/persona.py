@@ -30,8 +30,11 @@ from .segment import (
 
 
 STYLE_ANCHOR: dict[str, Any] = {
-    'max_chars_per_segment': 100,
-    'max_chars_total': 400,
+    # 主判据是句数不是字数：真人说话的长短用「说了几句」衡量，
+    # 5 句是产品硬上限——视频按分钟计费，她不能一口气讲一篇。
+    'max_sentences_total': 5,
+    'max_chars_per_segment': 80,
+    'max_chars_total': 260,
     'min_segments': 1,
     'max_segments': 6,
     'default_segments': 1,

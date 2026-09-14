@@ -149,7 +149,16 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     max_seg = STYLE_ANCHOR["max_segments"]
     res.add("V7_segment_count", min_seg <= n <= max_seg, detail=f"{n} 段")
 
-    # V9 台词长度
+    # V9 台词长度。
+    # 主判据改成句数：真人说话的长度用句数衡量，不是字数。
+    # 上限 5 句是产品硬规则——视频按分钟计费，她不能一口气讲一篇。
+    dialogue = turn.dialogue
+    sentences = [x for x in _SENTENCE_END.split(dialogue) if x.strip()]
+    max_sentences = STYLE_ANCHOR.get("max_sentences_total", 5)
+    res.add("V9_sentence_count", len(sentences) <= max_sentences,
+            detail=f"{len(sentences)} 句，超过 {max_sentences}")
+
+    # 字数上限放宽到只防极端，不作为主要约束
     total_chars = len(dialogue)
     res.add("V9_total_chars", total_chars <= STYLE_ANCHOR["max_chars_total"],
             detail=f"{total_chars}/{STYLE_ANCHOR['max_chars_total']} 字")

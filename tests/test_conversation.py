@@ -240,6 +240,149 @@ class ProactiveTests(unittest.TestCase):
         self.assertEqual(ctx.messages()[-1]['role'], 'user')
 
 
+class LengthTests(unittest.TestCase):
+    """回复长度要有参差。真人不会每轮都说得一样长。"""
+
+    def level(self, message, intent='share', policy='must'):
+        from language_core import compiler
+        return compiler.decide_length(user_message=message, intent=intent,
+                                      speak_policy=policy)[0]
+
+    def test_ack_gets_terse(self):
+        self.assertEqual(self.level('嗯'), 'terse')
+        self.assertEqual(self.level('好的'), 'terse')
+
+    def test_unwilling_gets_terse_and_no_followup(self):
+        """用户说不想聊，她只能应一声，不能追问。"""
+        self.assertEqual(self.level('算了不想说这个'), 'terse')
+        self.assertEqual(self.level('没事'), 'terse')
+
+    def test_question_gets_short(self):
+        self.assertEqual(self.level('你今天过得怎么样？', intent='probe'), 'short')
+
+    def test_plain_statement_gets_short(self):
+        self.assertEqual(self.level('今天天气不错'), 'short')
+
+    def test_conflict_gets_long(self):
+        """起了争执，她要把话说完。"""
+        self.assertEqual(self.level('你根本不懂我的意思', intent='refuse'), 'long')
+
+    def test_story_gets_long(self):
+        self.assertEqual(self.level('我跟你讲，今天遇到件离谱的事'), 'long')
+
+    def test_venting_is_medium_not_long(self):
+        """用户倒苦水是「要接住」，不是「她该讲故事」。
+
+        这一条曾经判错：『我今天加班到十点』命中了「我今天」这个故事标记，
+        结果她抢过话头讲自己的事。倾诉必须优先于讲故事。
+        """
+        long_vent = '我今天加班到十点，特别累，感觉自己什么都做不好，挺没用的'
+        self.assertEqual(self.level(long_vent, intent='comfort'), 'medium')
+
+    def test_close_and_silent_are_terse(self):
+        self.assertEqual(self.level('晚安', policy='close'), 'terse')
+        self.assertEqual(self.level('', policy='may_silent'), 'terse')
+
+    def test_every_level_has_a_guide(self):
+        from language_core import compiler
+        for level in (compiler.LENGTH_TERSE, compiler.LENGTH_SHORT,
+                      compiler.LENGTH_MEDIUM, compiler.LENGTH_LONG):
+            guide = compiler.LENGTH_GUIDE[level]
+            for key in ('sentences', 'how', 'example', 'ban'):
+                self.assertTrue(guide.get(key), f'{level} 缺 {key}')
+
+    def test_long_guide_caps_at_five_sentences(self):
+        """产品硬规则：整轮不超过 5 句。"""
+        from language_core import compiler
+        self.assertIn('5 句', compiler.LENGTH_GUIDE[compiler.LENGTH_LONG]['sentences'])
+
+    def test_sentence_cap_is_enforced(self):
+        from language_core.checker import check_turn
+        from language_core import persona
+        from language_core.segment import parse
+        scene = persona.load_scene('cafe')
+        stage = persona.STAGES[0]
+        six = '\n'.join(f'@seg type=dialogue\n第{i}句。' for i in range(1, 7))
+        turn = parse(six, allowed_expressions=scene.allowed_expressions(),
+                     default_expression='smile')
+        result = check_turn(turn, scene=scene, stage=stage)
+        self.assertIn('V9_sentence_count', [i.rule for i in result.items if not i.ok])
+
+    def test_length_rule_reaches_the_prompt(self):
+        from language_core import compiler, persona
+        from language_core.memory import RecallResult
+        ctx = compiler.compile_context(
+            char=persona.load_character('elise'), scene=persona.load_scene('cafe'),
+            stage=persona.STAGES[0], recall=RecallResult(), user_message='我跟你讲件离谱的事')
+        self.assertIn('这一轮说多少', ctx.system)
+        self.assertEqual(ctx.debug['length_level'], 'long')
+        # CORE 里不能再有「一到三句」这种区间——给区间模型必取中位
+        self.assertNotIn('一到三句', ctx.system)
+
+
+    def test_repeated_opening_is_caught(self):
+        """开头被原样搬过来要能判出来。
+
+        实测踩到的：上一条「这算哪门子厉害。你到底是饿了…」，
+        主动开口又来一句「这算哪门子厉害。行，我猜中了没有…」。
+        整句包含度只有 0.42，按整句判是判不出来的，
+        但用户一眼就看到「这算哪门子厉害」说了两遍。
+        """
+        from language_core import engine as E
+        prev = '这算哪门子厉害。你到底是饿了，还是故意逗我玩。'
+        dup = '这算哪门子厉害。行，我猜中了没有，你到底饿不饿。'
+        self.assertTrue(E._same_opening(dup, prev))
+        # 整句指标测不出来，这正是要单独加开头检测的原因
+        self.assertLess(E._containment(dup, prev), E.PROACTIVE_MAX_CONTAINMENT)
+
+    def test_different_opening_passes(self):
+        from language_core import engine as E
+        prev = '这算哪门子厉害。你到底是饿了，还是故意逗我玩。'
+        for text in ['行，我猜中了没有，你到底饿不饿。',
+                     '那你倒是说啊，我还没听到事呢。']:
+            self.assertFalse(E._same_opening(text, prev), text)
+
+    def test_trim_drops_the_repeated_opening(self):
+        """兜底做法：把重复的那一句删掉，留后面的。
+
+        让她重说一遍是没用的——实测模型还是会把同一个开头搬过来。
+        """
+        from language_core import engine as E
+        from language_core.segment import parse
+        prev = '这算哪门子厉害。你到底是饿了，还是故意逗我玩。'
+        dup = '这算哪门子厉害。行，我猜中了没有，你到底饿不饿。'
+        turn = parse('@seg type=dialogue\n' + dup,
+                     allowed_expressions=['smile'], default_expression='smile')
+        E._trim_proactive(turn, prev)
+        self.assertNotIn('这算哪门子厉害', turn.dialogue)
+        self.assertIn('饿', turn.dialogue)
+
+    def test_previous_line_reaches_the_prompt(self):
+        """上一条要原样写进提示词，模型才看得见自己刚说过什么。"""
+        from language_core import compiler, persona
+        prev = '这算哪门子厉害。你到底是饿了，还是故意逗我玩。'
+        text = compiler.proactive_instruction(persona.load_character('elise'),
+                                               persona.load_scene('cafe'), 'bored',
+                                               previous=prev)
+        self.assertIn('这算哪门子厉害', text)
+        self.assertIn('换个角度起头', text)
+
+    def test_strict_retry_gives_a_direction_not_a_ban(self):
+        """重试要说清「换成什么」，不是只说「不许用那个」。
+
+        实测：写成「绝对不许用某某开头」会让模型卡在那个词上，
+        接连几条都产不出东西。给方向才有效。
+        """
+        from language_core import compiler, persona
+        prev = '这算哪门子厉害。你到底是饿了，还是故意逗我玩。'
+        text = compiler.proactive_instruction(persona.load_character('elise'),
+                                               persona.load_scene('cafe'), 'bored',
+                                               strict=True, previous=prev)
+        self.assertIn('这算哪门子厉害', text)      # 指出是哪个起手
+        self.assertIn('完全不同的起手', text)      # 但给的是方向
+        self.assertNotIn('绝对不许', text)          # 不是划禁区
+
+
 class StoreTests(unittest.TestCase):
     def test_session_and_feedback_ownership(self):
         s=ConversationStore(':memory:')

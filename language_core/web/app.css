@@ -15,3 +15,5 @@
 .turn.proactive .speaker{color:var(--green);font-weight:600}
 .turn.proactive .self-start{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;font-size:9px;font-weight:500;letter-spacing:.3px;color:#3f6b4d;background:#edf4e8;border:1px solid #d8e2d0;vertical-align:1px}
 .turn.proactive .bubble{border-color:#d8e2d0;background:#fbfdf9}
+/* ── 长度档标记：让她这一轮说多说少一目了然 ── */
+.len-tag{display:inline-flex;align-items:center;font-size:10px;line-height:1;padding:3px 7px;border-radius:999px;border:1px dashed var(--line);color:var(--muted);background:#fafbf7}

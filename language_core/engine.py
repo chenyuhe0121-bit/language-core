@@ -121,12 +121,43 @@ def _containment(a: str, b: str) -> float:
     return len(ga & gb) / len(ga)
 
 
+import re as _re
+
+_SENTENCE_SPLIT = _re.compile(r'(?<=[。！!？?；;])')
+
+
+def _first_sentence(text: str) -> str:
+    """取第一句，去掉标点和空白，用于比对开头是否重复。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    parts = [p for p in _SENTENCE_SPLIT.split(t) if p.strip()]
+    head = parts[0] if parts else t
+    return _re.sub(r'[\s。！!？?；;，,、…]+', '', head)
+
+
+def _same_opening(a: str, b: str, min_len: int = 4) -> bool:
+    """她是不是把上一条的开头原样搬过来了。
+
+    「这算哪门子厉害。你到底是饿了…」→「这算哪门子厉害。行，我猜中了没有…」
+    整体重合度只有 0.42，按整句判是判不出来的，但用户一眼就看到重复了。
+    真正刺眼的是开头那一句被原样搬过来。
+
+    判定用精确相等，不用包含。用包含会误伤——
+    「厉害什么」是「厉害什么饿不饿还能猜错」的子串，但它其实是个正常的新起手。
+    """
+    ha, hb = _first_sentence(a), _first_sentence(b)
+    if len(ha) < min_len or len(hb) < min_len:
+        return False
+    return ha == hb
+
+
 def _proactive_violations(turn, previous: str) -> tuple[bool, list[str]]:
     """主动开口的硬约束。返回 (是否不合格, 原因)。
 
-    一段、不超过 40 字、不以问号结尾——这三条是产品要求：
+    一条、不超过 40 字、不以问号结尾——这三条是产品要求：
     用户在按分钟付费，起个头不该长篇大论，也不该变成提问。
-    与上一条重复那一条是实测踩出来的：模型会把上一轮说过的话
+    与上一条重复那两条是实测踩出来的：模型会把上一轮说过的话
     稍微改改再说一遍，用户看到的是「她怎么又说了一遍」。
     """
     problems: list[str] = []
@@ -142,13 +173,18 @@ def _proactive_violations(turn, previous: str) -> tuple[bool, list[str]]:
         problems.append('以问号结尾，这一轮不该提问')
     if previous and _containment(text, previous) > PROACTIVE_MAX_CONTAINMENT:
         problems.append('新说的几乎整句都在上一条里，等于重复')
+    elif previous and _same_opening(text, previous):
+        problems.append('开头和上一条一样')
     return bool(problems), problems
 
 
 def _trim_proactive(turn, previous: str):
-    """重试仍不合格时的兜底：压到一段、只留第一句、去掉问句。
+    """重试仍不合格时的兜底：压到一段、去掉重复的开头、去掉问句。
 
     宁可短，宁可少说一句，也不能让她在用户付费的时间里重复自己。
+
+    开头重复的处理是直接删掉那一句——实测下来这是最干净的做法：
+    让她重说一遍，模型还是会把同一个开头搬过来。
     """
     parts = [s for s in turn.segments if s.spoken and (s.text or '').strip()]
     keep = parts[0] if parts else None
@@ -157,9 +193,17 @@ def _trim_proactive(turn, previous: str):
 
     text = (keep.text or '').strip()
 
-    # 先只留第一句。硬截断会留下半句话，读起来更像出错。
-    import re as _re
-    sentences = [s for s in _re.split(r'(?<=[。！!？?])', text) if s.strip()]
+    # 开头和上一条一样 → 把这句删掉，只留后面的
+    if previous and _same_opening(text, previous):
+        sentences = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+        if len(sentences) > 1:
+            text = ''.join(sentences[1:]).strip()
+        else:
+            # 整句都是重复的，没有什么可留
+            raise RuntimeError('主动开口整句重复，本轮放弃')
+
+    # 再只留第一句。硬截断会留下半句话，读起来更像出错。
+    sentences = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()]
     if sentences:
         text = sentences[0].strip()
 
@@ -181,10 +225,7 @@ def _trim_proactive(turn, previous: str):
         if not text.endswith(('。', '！', '!', '，', '、', '；')):
             text += '。'
 
-    if previous and _containment(text, previous) > PROACTIVE_MAX_CONTAINMENT:
-        # 重试过还是重复，说明这次起头失败了。
-        # 与其让她在用户付费的时间里重复自己，不如这一轮闭嘴——
-        # 调用方按「没有产生台词」处理，等下一个静默周期再说。
+    if previous and _same_opening(text, previous):
         raise RuntimeError('主动开口与上一条重复，本轮放弃')
 
     if text and not text.endswith(('。', '！', '!', '…')):
@@ -330,6 +371,7 @@ class Engine:
                 char=char, scene=scene, stage=stage, recall=recall,
                 user_message="", intent="proactive", turn_count=turn_count,
                 proactive=kind, proactive_seed=seed, proactive_strict=strict,
+                proactive_previous=previous,
             )
 
         ctx = build(False)

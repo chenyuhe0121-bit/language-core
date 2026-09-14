@@ -16,7 +16,10 @@ CORE = '''你在与用户进行实时语音交流。成为给定的角色，直�
 你有自己的兴趣、观点、当下的心情和分寸。可以好奇、打趣、不同意、承认不知道，也可以认真关心。
 让交流有来有回：可以带一个具体观察、一点自己的想法，或一个确实想知道的问题。不要机械套用这个顺序，也不必每轮都问。
 延续双方正在谈的事，回应追问和纠正。避免重复开场、复述上一句、反复自我介绍或使用固定安慰模板。
-真实交流允许轻松、琐碎和停顿。普通回应通常一到三句；讲故事、解释或深聊时可以展开。长度跟随内容，不为凑字数补话。
+真实交流允许轻松、琐碎和停顿。**回复长度要参差**：能一个字就一个字，该展开时才展开。
+真人不会每轮都说得一样长——最短只有一声「嗯」，最长能讲一小段。
+长度由你此刻想干什么决定，不由「通常说几句」决定。整轮上限 5 句，任何情况都不要超过。
+不要为了显得在参与而补话，也不要每轮都反问。
 说出来要顺口。不要用列表、Markdown、舞台说明或第三人称小说旁白代替交流。情绪通过措辞、节奏和简短表情标签共同表达。
 不要替用户说话、做决定或编造用户的动作与感受。没有视觉输入时，不声称看到了用户的表情或环境。
 角色背景是设定，聊天历史是已经发生的交流；示例只说明口吻，并没有真的发生。不要把示例中的人名、事件当成用户经历。
@@ -74,6 +77,190 @@ def decide_speak_policy(*, scene, user_message, intent, turn_count=0, recent_use
     if is_minimal_ack(user_message): return 'brief', ['简单应声；结合上一轮自然承接']
     return 'must', ['按角色性格和上下文回应；分享也是交流邀请']
 
+
+# ---------------------------------------------------------------- 回复长度
+#
+# 真人说话的长度参差得很厉害：最短一个字，最长能讲一整段。
+# 「每轮两句」是最典型的 AI 腔，根因是我们给了模型一个区间（一到三句），
+# 它就永远取中位。所以这里不再给区间，而是先判断「她此刻想干什么」，
+# 长度跟着动机走。
+#
+# 上限 5 句。长回复只在三种情况下出现：她有故事要讲、她被触动了、
+# 或者她在争执。其他情况一律偏短。
+
+LENGTH_TERSE = 'terse'
+LENGTH_SHORT = 'short'
+LENGTH_MEDIUM = 'medium'
+LENGTH_LONG = 'long'
+
+# 长回复的触发信号：她在讲自己的事、被触动、或者在争
+_STORY_MARKERS = ('我跟你讲', '我跟你说', '你知道吗', '猜猜', '我今天',
+                  '我昨天', '我小时候', '以前有个人', '我遇到过')
+_CONFLICT_MARKERS = ('凭什么', '你根本', '你不懂', '不是这样', '我不这么', '你错了',
+                     '我不同意', '别这样', '你听我说', '我受够')
+_UNWILLING_MARKERS = ('不想聊', '不想说', '别问', '算了', '没事', '不想提')
+
+# 用户在问她自己的事。这是最自然的「她该多说点」的时刻——
+# 有人认真问起你的生活，你会讲，不会只答一个是或不是。
+_ASK_ABOUT_HER = (
+    '你平时', '你最近', '你喜欢', '你以前', '你怎么', '你为什么', '你觉得',
+    '你在做', '你在忙', '你那边', '你家', '你小时候', '你会不会', '你想不想',
+    '你有没', '你做什么', '你干什么', '你住', '你几岁', '你多大了', '你叫什么',
+)
+# 用户在往下挖同一个话题。追问说明他在乎，回答就不该越来越短。
+_FOLLOWUP_MARKERS = ('那你说', '那你的', '为什么', '怎么说', '然后呢', '还有呢',
+                     '展开说', '具体说', '举个例子', '后来呢')
+
+
+# 寒暄式问句。问的是「你好不好」，不是她的生活，
+# 所以她答一句就够，不用展开。这类要排在「问她的情况」之前判断。
+_SMALLTALK_QUESTIONS = (
+    '你怎么样', '你好吗', '你还好吗', '你在干嘛', '你在干什么', '你在做什么',
+    '你吃了吗', '你睡了吗', '你在忙吗', '你今天过得', '你过得怎么样',
+)
+
+
+def _is_smalltalk_question(t: str) -> bool:
+    return any(m in t for m in _SMALLTALK_QUESTIONS)
+
+
+# 敷衍式回复。用户在应付，不是在说话——这时候接一声就够。
+# 注意跟「短但完整的陈述」区分开：「今天天气不错」是陈述，该给一句完整的回应；
+# 「我还好」「先坐着吧」是在应付，答一句就够。
+_NONCOMMITTAL_MARKERS = (
+    '我还好', '还行', '还好', '随便', '都行', '也行', '无所谓', '不知道',
+    '没什么', '没事', '先这样', '就这样', '不用了', '算了',
+)
+
+
+def _is_noncommittal(t: str) -> bool:
+    return any(m in t for m in _NONCOMMITTAL_MARKERS)
+
+
+def _looks_like_question(t: str) -> bool:
+    """中文问句不一定带问号，也可能以「吗/呢/吧」这类语气助词收尾。"""
+    s = (t or '').rstrip().rstrip('。！!，,～~ ')
+    if s.endswith(('？', '?')):
+        return True
+    return s.endswith(('吗', '呢', '么'))
+
+
+def _is_asking_about_her(text: str) -> bool:
+    """用户在问她的情况，而不是问一个事实。
+
+    「这是什么音乐」是问事实；「你边画图边做咖啡吗」是问她的生活。
+    后者她应该答得具体些，而不是一句「不是」就完了。
+    """
+    t = (text or '').strip()
+    if not t:
+        return False
+    # 寒暄不算「问她的情况」——「你今天过得怎么样」答一句就够
+    if _is_smalltalk_question(t):
+        return False
+    if any(m in t for m in _ASK_ABOUT_HER):
+        return True
+    # 以「你」开头的问句，几乎都是在问她本人。
+    # 不要求「你」后面紧跟特定搭配——那样会漏掉「你边画图边做咖啡吗」这类说法。
+    if t.startswith('你') and _looks_like_question(t):
+        return True
+    # 短句里带「你」的疑问，多半也是在问她
+    return '你' in t and _looks_like_question(t) and len(t) <= 16
+
+
+def decide_length(*, user_message, intent, speak_policy, last_reply_was_silence=False):
+    """她这一轮该说多少。返回 (档位, 原因)。
+
+    顺序即优先级。前面几条是「不该多说」的强信号，后面是「该多说」的。
+    中间的判断按真实对话里最常出现的顺序排：
+    问她的生活 > 追问 > 倾诉 > 讲故事 > 问她事实 > 普通接话。
+    """
+    text = (user_message or '').strip()
+
+    # ---- 不该多说的，先拦 ----
+    if speak_policy == 'close':
+        return LENGTH_TERSE, '正在收尾，不要拖'
+    if speak_policy == 'may_silent':
+        return LENGTH_TERSE, '这一轮允许不说'
+    if speak_policy == 'brief' or is_minimal_ack(text):
+        return LENGTH_TERSE, '用户只应了一声，接住就行'
+    if any(m in text for m in _UNWILLING_MARKERS):
+        return LENGTH_TERSE, '用户不想谈这个，不追问'
+
+    # ---- 该多说的 ----
+    if intent == 'crisis':
+        return LENGTH_MEDIUM, '安全优先，说清楚但不铺陈'
+    if any(m in text for m in _CONFLICT_MARKERS) or intent == 'refuse':
+        return LENGTH_LONG, '起了争执，她要把话说完'
+    # 问她的生活：这是最自然的展开时机，不能只答是或不是
+    if _is_asking_about_her(text):
+        return LENGTH_MEDIUM, '用户在问她的情况，应该答具体些'
+    if any(m in text for m in _FOLLOWUP_MARKERS):
+        return LENGTH_MEDIUM, '用户在追问同一件事，别越答越短'
+    # 倾诉优先于「讲故事」：用户说「我今天加班到十点」是在倒苦水，
+    # 不是在给角色递一个讲故事的引子。顺序反了她会抢话。
+    if intent == 'comfort':
+        return LENGTH_MEDIUM, '用户在倾诉，要接住'
+    if any(m in text for m in _STORY_MARKERS):
+        return LENGTH_LONG, '她要讲一件具体的事'
+    if len(text) >= 60:
+        return LENGTH_MEDIUM, '用户说了很长一段，得认真接'
+
+    # ---- 剩下的按问句和陈述分开 ----
+    if intent == 'probe':
+        return LENGTH_SHORT, '用户在问一个事实，先答，别绕'
+    # 明确敷衍的回复 → 接一声就够；普通短陈述 → 还是给一句完整的
+    if _is_noncommittal(text):
+        return LENGTH_TERSE, '用户答得很敷衍，接一声就够'
+    return LENGTH_SHORT, '用户说了一句完整的话，接住就好'
+
+
+LENGTH_GUIDE = {
+    LENGTH_TERSE: {
+        'sentences': '就一句，10 字以内',
+        'how': '只应一声。不要补充，不要反问，不要解释。',
+        'example': '「嗯。」「行。」「那就好。」「没事，坐着吧。」',
+        'ban': '不要加任何延伸。这一轮你就是在敷衍地应一声。',
+    },
+    LENGTH_SHORT: {
+        'sentences': '1 句，不超过 25 字',
+        'how': '接住对方这一句，说完就停。要带情绪或态度，但不要展开。',
+        'example': '「笑成这样，今天这杯没白喝。」',
+        'ban': '不要讲自己的类似经历，不要给建议，不要追问第二个问题。',
+    },
+    LENGTH_MEDIUM: {
+        'sentences': '2 到 3 句，40 到 80 字',
+        'how': '答具体一点：说一个事实、加一点自己的态度，可以带一个反问。'
+               '这一段要让对方多知道一点关于你的事。',
+        'example': '「不是，咖啡店是白天的兼职，画图是下班后的事。'
+                   '两码事，别混一块儿。」',
+        'ban': '不要罗列好几件事，不要只给态度不给内容。',
+    },
+    LENGTH_LONG: {
+        'sentences': '3 到 5 句，不超过 5 句',
+        'how': '完整讲一件事：有起因、有过程、有细节。'
+               '可以拆成 2 到 3 段发。',
+        'example': '「我跟你讲，今天店里来了个人，进门先站了半分钟没说话，'
+                   '我以为他要问路。结果他掏出一张纸，上面写了三种豆子，'
+                   '问能不能一样来一点。」',
+        'ban': '不要只讲态度不讲事。讲不出细节就退回短的那档——'
+               '宁可短而准，不要长而空。',
+    },
+}
+
+
+def render_length_rule(level, reason=''):
+    guide = LENGTH_GUIDE.get(level) or LENGTH_GUIDE[LENGTH_SHORT]
+    reason_line = f'（判断依据：{reason}）' if reason else ''
+    return (
+        f'## 这一轮说多少\n'
+        f'**{guide["sentences"]}。**{reason_line}\n'
+        f'{guide["how"]}\n'
+        f'示例：{guide["example"]}\n'
+        f'避免：{guide["ban"]}\n'
+        f'整轮上限 5 句，任何情况都不要超过。'
+    )
+
+
 def render_fixed(char, scene=None):
     raw = char.raw
     if raw.get('description') is not None:
@@ -107,7 +294,7 @@ def render_memory(recall):
 def render_recent(recall):
     return '\n'.join(f'{t.role}: {t.content}' for t in recall.recent)
 
-def output_format_rules(scene, stage, char, policy='must', policy_reasons=None):
+def output_format_rules(scene, stage, char, policy='must', policy_reasons=None, length_level=LENGTH_SHORT, length_reason=''):
     policy_text = {'close': '本轮自然道别，不挽留。', 'brief': '本轮简单应声，结合前文决定是否补充。', 'may_silent': '本轮允许只给动作。'}.get(policy, '本轮自然交流，由你的性格决定说什么、如何说。')
     return f'''输出协议：每个可独立播放的短句或意群为一段，通常 1–3 段，最多 6 段。段间独立一行 [sep]。
 每段以这一行开头：
@@ -115,9 +302,11 @@ def output_format_rules(scene, stage, char, policy='must', policy_reasons=None):
 下一行直接写要说的台词，不加引号和括号。不要输出推理过程或解释这些字段。
 情绪：neutral,happy,concern,sad,playful,shy,annoyed,surprised；强度 0–1，描述你此刻表达的情绪，不是给用户贴标签。
 语速：slow,normal,fast。表情：{','.join(scene.allowed_expressions())}。
-保持台词与情绪一致。无需每段改变情绪；避免夸张表演。单段通常不超过 80 字，一轮最多 400 字。
+保持台词与情绪一致。无需每段改变情绪；避免夸张表演。单段通常不超过 80 字，整轮不超过 5 句。
 非语言动作确有必要时可用 type=action，下一行写（简短动作），不朗读；不要用动作替代用户期待的回答。
-{policy_text}'''
+{policy_text}
+
+{render_length_rule(length_level, length_reason)}'''
 
 def resolve_params(intent, stage, scene, policy='must'):
     params = dict(config.PARAMS_DEFAULT)
@@ -125,7 +314,18 @@ def resolve_params(intent, stage, scene, policy='must'):
     return params
 
 
-def proactive_instruction(char, scene, kind, seed=0, strict=False):
+def _first_sentence_of(text: str) -> str:
+    """取第一句（去掉标点），用于告诉模型「这个开头不许再用」。"""
+    import re as _re
+    t = (text or '').strip()
+    if not t:
+        return ''
+    parts = [p for p in _re.split(r'(?<=[。！!？?；;])', t) if p.strip()]
+    head = parts[0] if parts else t
+    return _re.sub(r'[\s。！!？?；;，,、…]+', '', head)
+
+
+def proactive_instruction(char, scene, kind, seed=0, strict=False, previous=''):
     """主动开口要说什么，以及绝对不要说什么。
 
     这是整个功能里最需要克制的一段。产品是视频按分钟计费，
@@ -178,6 +378,32 @@ def proactive_instruction(char, scene, kind, seed=0, strict=False):
     ]
     if sample:
         lines += ['', sample]
+
+    # 把上一条原样摆出来。只说「不要重复」不够——
+    # 实测里模型会把上一条的开头原封不动搬过来（「这算哪门子厉害。」），
+    # 整体重合度不高所以判不出重复，但用户一眼就看到了。
+    #
+    # 语气要小心：写成「绝对不许用某个词」会让模型卡在那个词上反复重来，
+    # 实测三条里有两条直接产不出东西。所以给方向，不给禁区。
+    if previous:
+        head = _first_sentence_of(previous)
+        lines += [
+            '',
+            '## 承接上文',
+            f'你刚才说的是：「{previous.strip()[:120]}」',
+            '',
+        ]
+        if strict and head:
+            lines += [
+                f'刚才那句是从「{head}」起头的。换一个完全不同的起手——',
+                '例如把注意力转到你手上的动作、环境里刚发生的事，'
+                '或者你此刻的某个感受。',
+            ]
+        else:
+            lines += [
+                '这一轮要换个角度起头：说你手上的动作、环境里的动静，'
+                '或者你此刻的状态。不要沿着刚才那句往下说。',
+            ]
     if how:
         lines += ['', f'按你的性格，你会这样：{how}']
     if kind == 'inviting' and activities:
@@ -216,24 +442,28 @@ def proactive_instruction(char, scene, kind, seed=0, strict=False):
 
 def compile_context(*, char, scene, stage, recall, user_message, intent=None, turn_count=0,
                     last_reply_was_silence=False, extra_system='',
-                    proactive=None, proactive_seed=0, proactive_strict=False):
+                    proactive=None, proactive_seed=0, proactive_strict=False,
+                    proactive_previous=''):
     """拼出这一轮的上下文。
 
     proactive 非空时是「她主动开口」的一轮：没有用户输入，
     历史以她自己的话结尾，末尾插一条指令告诉模型该她起头了。
     """
     policy, reasons = decide_speak_policy(scene=scene, user_message=user_message, intent=intent, turn_count=turn_count)
+    length_level, length_reason = decide_length(
+        user_message=user_message, intent=intent, speak_policy=policy,
+        last_reply_was_silence=last_reply_was_silence)
     examples = char.raw.get('examples', [])
     example_text = '口吻示例（独立虚构片段，不属于当前聊天；学习反应方式，不照抄）：\n' + json.dumps(examples, ensure_ascii=False) if examples else ''
     blocks = {'core': CORE, 'boundary': BOUNDARIES, 'fixed': render_fixed(char), 'state': render_state(stage, recall.profile),
               'scene': render_scene(scene), 'card_scenario': ('角色卡背景情境（当前场景优先）：' + str(char.raw.get('scenario', ''))) if char.raw.get('scenario') else '', 'examples': example_text, 'memory': render_memory(recall),
-              'format_rules': output_format_rules(scene, stage, char, policy)}
+              'format_rules': output_format_rules(scene, stage, char, policy, reasons, length_level, length_reason)}
     if extra_system: blocks = {'priority': extra_system, **blocks}
     if proactive:
         # 主动开口必须放在 system 最末尾。
         # 放中间会被后面的格式规则和记忆盖过去，模型会当成「继续刚才的剧情」
         # 而不是「起一个新话头」——实测过，两种方式的边界会守不住。
-        blocks = {**blocks, 'proactive': proactive_instruction(char, scene, proactive, proactive_seed, proactive_strict)}
+        blocks = {**blocks, 'proactive': proactive_instruction(char, scene, proactive, proactive_seed, proactive_strict, proactive_previous)}
     report = BudgetReport(used={k: len(v) for k, v in blocks.items()})
     system = '\n\n'.join(v for v in blocks.values() if v)
     system = system.replace('{{char}}', char.name).replace('{{user}}', '对方')
@@ -260,6 +490,7 @@ def compile_context(*, char, scene, stage, recall, user_message, intent=None, tu
              'recalled_memory_ids': [m.id for m in recall.memories], 'recalled_memory_preview': [m.content for m in recall.memories],
              'open_loops': [l.topic for l in recall.open_loops], 'has_summary': bool(recall.summary), 'recent_count': len(history),
              'allowed_expressions': scene.allowed_expressions(), 'intensity_cap': 1.0, 'max_segments': 6,
-             'proactive': proactive or None}
+             'proactive': proactive or None,
+             'length_level': length_level, 'length_reason': length_reason}
     return CompiledContext(system, user_message, resolve_params(intent, stage, scene, policy), report,
                            debug, history, bool(proactive))
