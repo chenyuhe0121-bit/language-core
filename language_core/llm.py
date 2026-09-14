@@ -20,6 +20,7 @@ from typing import Any
 
 from . import config
 from .memory import RecallResult, looks_like_name_query, looks_like_recall_query
+from .compiler import is_minimal_ack
 
 
 @dataclass
@@ -427,20 +428,76 @@ class MockLLM:
                 "（把这个名字在嘴上念了一遍）那下次你进来，我就直接叫你了。",
             ], attempt)
 
-        # ---- 分支 3：点单。她是咖啡店店员，用户点了东西必须接住 ----
+        # 这一轮该说多少，由编译器判断后写进 debug
+        policy = (context or {}).get("speak_policy", "must")
+
+        # ---- 点单相关的前置计算：问候分支要用到 drink，所以放在最前 ----
         drink = None
         if scene_id == "cafe":
             for word in _DRINK_WORDS:
                 if word in msg:
                     drink = word
                     break
-        if drink and any(v in msg for v in ("要", "点", "来", "给我", "喝", "杯")):
+
+        asked_detail = any(
+            "加糖" in (t.content or "") or "大杯" in (t.content or "")
+            or "热的还是" in (t.content or "")
+            for t in recent[-3:] if t.role == "assistant"
+        )
+        # 她已经问过细节、并且用户已经回答过 → 状态要重置，不能一问再问
+        detail_answered = any(
+            (t.content or "").startswith("好。稍等") for t in recent[-2:]
+            if t.role == "assistant"
+        )
+        asked_detail = asked_detail and not detail_answered
+
+        # ---- 分支 3：见面问候 ----
+        # 必须排在沉默分支之前（否则首轮打招呼会被当成应声词）；
+        # 但整句是点单或其他实质内容时，优先交给后面的分支处理。
+        if (first_turn and not drink) or _is_bare_greeting(msg):
+            pair = _OPENINGS.get(scene_id, _OPENINGS["cafe"])
+            which = 0 if first_turn else 1
+            return self._wrap([
+                f"@seg type=dialogue_with_narration emotion=neutral:0.3 pace=normal expr={default_expr} intent=idle",
+                pair[which],
+            ], attempt)
+
+        # ---- 分支 4：点单。她是咖啡店店员，用户点了东西必须接住 ----
+        # 动线：take_order -> confirm（只问一个细节）-> make（不说话）-> serve
+        order_verbs = ("要", "点", "来", "给我", "喝", "杯")
+        looks_like_order = drink and (
+            any(v in msg for v in order_verbs) or len(msg.strip()) <= 6
+        )
+        if looks_like_order:
             return self._wrap([
                 f"@seg type=dialogue emotion=neutral:0.3 pace=normal expr={default_expr} intent=agree",
-                f"{drink}，好的。",
+                f"{drink}。热的还是冰的？",
+            ], attempt)
+
+        # 用户回答了她刚才问的那个细节 → confirm 完成，转入 make（不说话）
+        if asked_detail and len(msg) <= 6:
+            return self._wrap([
+                f"@seg type=dialogue emotion=neutral:0.3 pace=normal expr=nod intent=agree",
+                "好。稍等。",
                 "[sep]",
-                f"@seg type=dialogue_with_narration emotion=neutral:0.3 pace=normal expr=look_down intent=idle",
-                "（转身去磨豆子，手上很稳）",
+                f"@seg type=action emotion=neutral:0.2 pace=normal expr=look_down intent=idle",
+                "转身去磨豆子，机器响了一阵",
+            ], attempt)
+
+        # ---- 分支 5：这一轮允许沉默，或用户只是应了一声 ----
+        # 这是治「没话找话」的关键分支：不提问，不找新话题，让动线继续走。
+        if policy == "may_silent" or (policy == "brief" and is_minimal_ack(msg)):
+            silent_lines = {
+                "cafe": ("（把吧台从这头擦到那头，没抬头）", "顺手把架子上的杯子摆正"),
+                "park": ("（继续往前走，脚步没停）", "（低头看了看脚边的小石子）"),
+                "amusement": ("（跟着音乐点着脚尖，没说话）", "（被旁边的叫声分了神）"),
+                "living_room": ("（捧着杯子，看着窗外的雨）", "（没说话，只是把毯子往上拉了拉）"),
+                "bedroom": ("（很轻地应了一声，没再多说）", "（翻了个身，没接话）"),
+            }
+            line = silent_lines.get(scene_id, silent_lines["cafe"])[attempt % 2]
+            return self._wrap([
+                f"@seg type=action emotion=neutral:0.2 pace=normal expr=look_down intent=idle",
+                line,
             ], attempt)
 
         # ---- 分支 4：用户在让她翻记忆 ----
@@ -494,16 +551,7 @@ class MockLLM:
                 "（其实我一直记着，只是没找到合适的时候问。）",
             ], attempt)
 
-        # ---- 分支 6：真实打招呼。只认整句就是问候的情况，必须排在记忆线索之前 ----
-        if first_turn or _is_bare_greeting(msg):
-            pair = _OPENINGS.get(scene_id, _OPENINGS["cafe"])
-            which = 0 if first_turn else 1
-            return self._wrap([
-                f"@seg type=dialogue_with_narration emotion=neutral:0.3 pace=normal expr={default_expr} intent=idle",
-                pair[which],
-            ], attempt)
-
-        # ---- 分支 7：有召回记忆，可以自然带上 ----
+        # ---- 分支 8：有召回记忆，可以自然带上 ----
         # 但用户在问「我叫什么」时不能走这里，否则会答非所问地夸自己记性好。
         # 刚提过的事也不再重复提，否则每轮都在炫耀同一段记忆。
         said_before = "".join(t.content or "" for t in recent[-6:] if t.role == "assistant")

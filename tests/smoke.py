@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("PYTHONUTF8", "1")
 
 from language_core import config, persona  # noqa: E402
+from language_core import compiler as compiler_mod  # noqa: E402
 from language_core import memory as memory_mod  # noqa: E402
 from language_core.engine import Engine  # noqa: E402
 from language_core.memory import MemoryStore  # noqa: E402
@@ -197,9 +198,13 @@ def main() -> int:
     check("第二句不是开场白", "想喝点什么" not in replies[1], replies[1])
 
     # ---- 15. 未闭合话题不每轮重复追问 ----
+    # 注意：陈述一件事时她按新规则可能只应一声、并不追问，
+    # 所以这里用提问式的话头来触发主动提起。
     eng3.respond(user_id="u_loop", character_id=C, scene_id="cafe", message="我明天有个面试")
-    ask1 = eng3.respond(user_id="u_loop", character_id=C, scene_id="cafe", message="嗯").turn.dialogue
-    ask2 = eng3.respond(user_id="u_loop", character_id=C, scene_id="cafe", message="嗯嗯").turn.dialogue
+    ask1 = eng3.respond(user_id="u_loop", character_id=C, scene_id="cafe",
+                        message="面试那件事你觉得怎么样？").turn.dialogue
+    ask2 = eng3.respond(user_id="u_loop", character_id=C, scene_id="cafe",
+                        message="嗯嗯那件事呢？").turn.dialogue
     check("话题被提起一次", "后来怎么样了" in ask1, ask1[:40])
     check("不会每轮重复追问", "后来怎么样了" not in ask2, ask2[:40])
 
@@ -231,7 +236,57 @@ def main() -> int:
                        message="再说一次我点了什么")
     check("换个问法仍能答出", "美式" in r20.turn.dialogue, r20.turn.dialogue[:40])
 
-    # ---- 21. 数据权利 ----
+    # ---- 21. 允许沉默：用户没发起话题时，她可以只给动作 ----
+    eng5 = fresh_engine("silence")
+    eng5.respond(user_id="u_s", character_id=C, scene_id="cafe", message="你好")
+    eng5.respond(user_id="u_s", character_id=C, scene_id="cafe", message="冰美式")
+    r21a = eng5.respond(user_id="u_s", character_id=C, scene_id="cafe", message="不用")
+    r21b = eng5.respond(user_id="u_s", character_id=C, scene_id="cafe", message="嗯")
+    check("确认细节后转入做事",
+          any(not s.spoken for s in r21a.turn.segments) or len(r21a.turn.segments) <= 2,
+          " / ".join((s.text or "")[:20] for s in r21a.turn.segments))
+    check("用户只说应声词时允许沉默",
+          r21b.context.debug.get("speak_policy") in ("may_silent", "brief"),
+          r21b.context.debug.get("speak_policy", ""))
+    check("沉默时校验不判失败", not r21b.checks.get("hard_fail"),
+          str(r21b.checks.get("failed")))
+
+    # ---- 22. 段数上限：不能每次都两个气泡 ----
+    seg_counts = []
+    eng6 = fresh_engine("segs")
+    for m in ["你好", "冰美式", "不用", "嗯", "今天天气不错"]:
+        rr = eng6.respond(user_id="u_seg", character_id=C, scene_id="cafe", message=m)
+        seg_counts.append(len(rr.turn.segments))
+    max_seg = persona.STYLE_ANCHOR["max_segments"]
+    check("段数都不超过上限", all(n <= max_seg for n in seg_counts), str(seg_counts))
+    check("不是每轮都发两段", seg_counts.count(2) < len(seg_counts),
+          str(seg_counts))
+
+    # ---- 23. 场景走完的条件是可判定的 ----
+    check("收尾语能识别", compiler_mod.user_said_farewell("先这样，明天聊"))
+    check("普通陈述不误判为收尾", not compiler_mod.user_said_farewell("今天天气不错"))
+    r23 = eng6.respond(user_id="u_seg", character_id=C, scene_id="cafe",
+                       message="晚安，我先睡了")
+    check("收尾时不开新话题",
+          r23.context.debug.get("speak_policy") == "close",
+          r23.context.debug.get("speak_policy", ""))
+
+    # ---- 24. 五张卡的字段完整性 ----
+    ch = persona.load_character(C)
+    check("角色卡有性格因果链", bool(ch.trait_causes))
+    check("每条因果链都有具体表达",
+          all(tc.get("expression") for tc in ch.trait_causes))
+    check("角色卡有不能做清单", bool(ch.cannot_do.get("never")))
+    check("角色卡有可以做清单", bool(ch.cannot_do.get("may")))
+    for sid in persona.all_scene_ids():
+        sc = persona.load_scene(sid)
+        if not (sc.progress_condition() and sc.beats() and sc.interaction_gate.get("never")):
+            check(f"场景 {sid} 字段完整", False, "缺 progress_condition / beats / gate")
+            break
+    else:
+        check("全部场景字段完整", True)
+
+    # ---- 25. 数据权利 ----
     exported = eng2.store.export_user(U, C)
     check("可导出用户数据", "memories" in exported and "messages" in exported)
     deleted = eng2.store.delete_user(U, C)
@@ -239,6 +294,8 @@ def main() -> int:
 
     eng3.shutdown()
     eng4.shutdown()
+    eng5.shutdown()
+    eng6.shutdown()
 
     eng.shutdown()
     eng2.shutdown()

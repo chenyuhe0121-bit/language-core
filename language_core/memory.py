@@ -124,10 +124,13 @@ class WorkingTurn:
     content: str
     scene_id: str | None = None
     created_at: str = ""
+    spoken: bool = True
+    seg_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {"role": self.role, "content": self.content,
-                "scene_id": self.scene_id, "created_at": self.created_at}
+                "scene_id": self.scene_id, "created_at": self.created_at,
+                "spoken": self.spoken, "seg_count": self.seg_count}
 
 
 @dataclass
@@ -158,6 +161,8 @@ CREATE TABLE IF NOT EXISTS message (
     scene_id     TEXT,
     role         TEXT NOT NULL,
     content      TEXT NOT NULL,
+    spoken       INTEGER NOT NULL DEFAULT 1,
+    seg_count    INTEGER NOT NULL DEFAULT 1,
     created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_message_lookup ON message(user_id, character_id, id);
@@ -209,7 +214,32 @@ class MemoryStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """给已存在的旧库补上新增的列。
+
+        上线过的库不能重建，用户数据不能丢。
+        每加一列就在这里登记，启动时自动补齐。
+        """
+        wanted = {
+            "message": {
+                "spoken": "INTEGER NOT NULL DEFAULT 1",
+                "seg_count": "INTEGER NOT NULL DEFAULT 1",
+            },
+        }
+        for table, columns in wanted.items():
+            try:
+                existing = {
+                    r["name"] for r in
+                    self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+            except sqlite3.Error:
+                continue
+            for name, decl in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # ---- 用户画像 ----
 
@@ -233,25 +263,54 @@ class MemoryStore:
     # ---- 工作记忆 ----
 
     def add_message(self, user_id: str, character_id: str, role: str, content: str,
-                    scene_id: str | None = None) -> str:
+                    scene_id: str | None = None, spoken: bool = True,
+                    seg_count: int = 1) -> str:
         mid = f"m_{uuid.uuid4().hex[:12]}"
         with self._lock:
             self._conn.execute(
-                "INSERT INTO message(id, user_id, character_id, scene_id, role, content, created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (mid, user_id, character_id, scene_id, role, content, _now()),
+                "INSERT INTO message(id, user_id, character_id, scene_id, role, content, spoken, seg_count, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (mid, user_id, character_id, scene_id, role, content,
+                 1 if spoken else 0, int(seg_count), _now()),
             )
             self._conn.commit()
         return mid
 
+    def last_assistant_was_silent(self, user_id: str, character_id: str) -> bool:
+        """上一轮她是不是只给了动作、没有台词。
+
+        这是判断「能不能继续安静」的依据，不是靠模型自觉。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT spoken FROM message WHERE user_id=? AND character_id=? AND role='assistant' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (user_id, character_id),
+            ).fetchone()
+        if row is None:
+            return False
+        return not bool(row["spoken"])
+
+    def last_assistant_opening(self, user_id: str, character_id: str,
+                               limit: int = 3) -> list[str]:
+        """最近几轮她说过的话，用于检测开场白重复。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT content FROM message WHERE user_id=? AND character_id=? AND role='assistant' "
+                "ORDER BY rowid DESC LIMIT ?",
+                (user_id, character_id, limit),
+            ).fetchall()
+        return [r["content"] for r in rows if r["content"]]
+
     def recent_turns(self, user_id: str, character_id: str, limit: int) -> list[WorkingTurn]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT role, content, scene_id, created_at FROM message "
+                "SELECT role, content, scene_id, spoken, seg_count, created_at FROM message "
                 "WHERE user_id=? AND character_id=? ORDER BY rowid DESC LIMIT ?",
                 (user_id, character_id, limit),
             ).fetchall()
-        return [WorkingTurn(r["role"], r["content"], r["scene_id"], r["created_at"])
+        return [WorkingTurn(r["role"], r["content"], r["scene_id"], r["created_at"],
+                            bool(r["spoken"]), int(r["seg_count"] or 1))
                 for r in reversed(rows)]
 
     def message_count(self, user_id: str, character_id: str) -> int:

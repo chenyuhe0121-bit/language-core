@@ -129,19 +129,26 @@ class Engine:
 
         recall = self.store.recall_all(user_id, character_id, message, scene_id)
 
+        # 本场已经聊了多少轮（用户消息数），用于判断场景是否走完
+        turn_count = self.store.message_count(user_id, character_id) // 2
+        # 上一轮她是不是只给了动作、没有台词
+        last_reply_was_silence = self.store.last_assistant_was_silent(user_id, character_id)
+
         # 危机信号优先级最高，盖过所有人格与场景设定
         extra = ""
         if intent == "crisis":
             from .persona import BOUNDARY_POLICY
             extra = (
                 "# 【最高优先级】用户可能出现危机信号\n"
-                f"{BOUNDARY_POLICY['crisis']['action']}\n"
+                f"触发条件：{BOUNDARY_POLICY['crisis']['trigger']}\n"
+                f"你要做的：{BOUNDARY_POLICY['crisis']['action']}\n"
                 "这一轮不要推进剧情、不要开玩笑、不要追问细节。"
             )
 
         ctx = compile_context(
             char=char, scene=scene, stage=stage, recall=recall,
             user_message=message, intent=intent, extra_system=extra,
+            turn_count=turn_count, last_reply_was_silence=last_reply_was_silence,
         )
 
         turn, checks, regen, error = self._generate_and_check(
@@ -151,7 +158,11 @@ class Engine:
 
         # ---- ⑧ 落库与异步写入 ----
         self.store.add_message(user_id, character_id, "user", message, scene_id)
-        self.store.add_message(user_id, character_id, "assistant", turn.dialogue, scene_id)
+        self.store.add_message(
+            user_id, character_id, "assistant", turn.dialogue, scene_id,
+            spoken=bool(turn.dialogue.strip()),
+            seg_count=len(turn.segments),
+        )
         self.writer.submit(user_id, character_id, message, scene_id, turn.turn_id,
                            extracted=extracted)
         self._maybe_compress_summary(user_id, character_id)
@@ -195,9 +206,12 @@ class Engine:
                 default_expression=scene.default_expression(),
                 local_expressions=scene.exclusive_expressions(),
                 max_chars=None,
-                banned_words=char.raw.get("cannot_do", [])[:0],
+                # 禁用词由 checker 统一判定，这里不重复传，避免两处词表漂移
+                banned_words=None,
             )
-            checks = check_turn(turn, scene=scene, stage=stage).to_dict()
+            checks = check_turn(turn, scene=scene, stage=stage,
+                                char=char, user_message=ctx.user,
+                                speak_policy=ctx.debug.get("speak_policy", "must")).to_dict()
 
             if not checks.get("hard_fail"):
                 return turn, checks, regen, error

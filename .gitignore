@@ -13,6 +13,9 @@ data/*.db-wal
 data/_*
 .tmp/
 
+# ---- 一次性运维工具（含本地凭据文件依赖，不进仓库）----
+tools/push_to_github.py
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

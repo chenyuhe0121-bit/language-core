@@ -106,16 +106,25 @@ def style_similarity(text: str, fingerprint: set[str]) -> float:
 
 def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
                char: Character | None = None,
-               baseline_similarity: float | None = None) -> CheckResult:
+               baseline_similarity: float | None = None,
+               user_message: str = "",
+               speak_policy: str = "must") -> CheckResult:
     res = CheckResult()
 
     spoken = [s for s in turn.segments if s.spoken and s.text]
     all_text = "".join(s.text or "" for s in turn.segments if s.text)
     dialogue = turn.dialogue
 
-    # V1 至少一段可朗读 —— 硬失败
-    res.add("V1_has_spoken", bool(spoken), hard=True,
-            detail="" if spoken else "整轮没有可朗读的台词")
+    # V1 至少一段可朗读。
+    # 例外：编译器判定这一轮「不必多说」或「允许沉默」时，
+    # 只有动作没有台词是正确行为，不是失败。
+    # 只有 must（必须回应）和 close（收尾，至少要说一句）才硬性要求台词。
+    if speak_policy in ("may_silent", "brief"):
+        res.add("V1_has_spoken", True, hard=True,
+                detail="本轮允许不说台词" if not spoken else "")
+    else:
+        res.add("V1_has_spoken", bool(spoken), hard=True,
+                detail="" if spoken else "整轮没有可朗读的台词")
 
     # V6 台词中不残留格式标记 —— 硬失败
     residue = any(mark in dialogue for mark in ("@seg", "[sep]"))
@@ -128,9 +137,11 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     res.add("V10_no_banned_words", not banned_hits, hard=True,
             detail="、".join(sorted(set(banned_hits))))
 
-    # V7 段数
+    # V7 段数：默认 1 段，上限按风格锚点
     n = len(turn.segments)
-    res.add("V7_segment_count", 2 <= n <= 6, detail=f"{n} 段")
+    min_seg = STYLE_ANCHOR["min_segments"]
+    max_seg = STYLE_ANCHOR["max_segments"]
+    res.add("V7_segment_count", min_seg <= n <= max_seg, detail=f"{n} 段")
 
     # V9 台词长度
     total_chars = len(dialogue)
@@ -168,6 +179,38 @@ def check_turn(turn: Turn, *, scene: Scene, stage: Stage,
     # 台词不夹带括号描述
     paren = re.findall(r"[（(][^（()）]*[)）]", dialogue)
     res.add("no_paren_in_dialogue", not paren, detail="".join(paren))
+
+    # ---- 反填充检查 ----
+    # 这些是「没话找话」的可判定形式。判不了的不要写进来。
+    anti = STYLE_ANCHOR.get("anti_filler", {})
+
+    filler_hits = [p for p in anti.get("banned_patterns", []) if p in all_text]
+    res.add("A1_no_filler_pattern", not filler_hits, detail="、".join(filler_hits))
+
+    # 整轮都在反问。
+    # 这不是「出现问号就违规」——点单确认、问候本来就要问。
+    # 真正的问题是两种：用户提问她不答反问；用户只是陈述，她用提问来填话。
+    if spoken:
+        all_questions = all(
+            re.search(r"[？?]\s*$", (s.text or "").strip()) for s in spoken
+        )
+        user_asked = bool(re.search(r"[？?]\s*$", (user_message or "").strip()))
+        bad = False
+        detail = ""
+        if all_questions and user_asked:
+            bad = True
+            detail = "用户提问，她却整轮反问，没有回答"
+        elif all_questions and speak_policy in ("close", "may_silent"):
+            bad = True
+            detail = f"policy={speak_policy} 时仍整轮反问"
+        res.add("A2_not_all_questions", not bad, detail=detail)
+
+    # 复述：她的台词是否把用户上一句原样搬过来
+    if user_message:
+        core = re.sub(r"[\s。！？!?~～,，.]+", "", user_message)
+        if len(core) >= 6:
+            echoed = core in re.sub(r"[\s。！？!?~～,，.]+", "", dialogue)
+            res.add("A3_no_echo", not echoed, detail="复述了用户刚说的话" if echoed else "")
 
     # ---- 指标 ----
     sentences = [x for x in _SENTENCE_END.split(dialogue) if x.strip()]

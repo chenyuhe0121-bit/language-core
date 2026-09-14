@@ -29,6 +29,9 @@ FLP 解决了传输、形象驱动和语音，companion-prototype 解决了界�
 | docs/01-tech-stack.md | 八项技术决策与理由 |
 | docs/02-segment-protocol.md | 台词/旁白协议 segproto/1 |
 | docs/03-architecture.md | 八个环节、五张卡、记忆四层、校验器 |
+| docs/04-reading-the-memory-system.md | 记忆系统代码导读 |
+| docs/05-five-part-architecture.md | 五段式提示词架构 |
+| docs/06-git-sync.md | 同步到 GitHub |
 
 ## 运行
 
