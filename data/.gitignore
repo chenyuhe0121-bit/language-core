@@ -1,0 +1,4 @@
+# 运行期数据，不进版本库。
+# 这里会有 llm.env（含 API key）和 SQLite 数据库。
+*
+!.gitignore
