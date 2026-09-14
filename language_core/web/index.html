@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Language Core · 语言系统内核</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-name">Language Core</div>
+      <div class="brand-sub">语言系统内核 v0.1</div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">当前状态</div>
+      <div class="kv"><span>场景</span><b id="s-scene">—</b></div>
+      <div class="kv"><span>关系阶段</span><b id="s-stage">—</b></div>
+      <div class="kv"><span>亲密度</span><b id="s-intimacy">—</b></div>
+      <div class="kv"><span>模式</span><b id="s-mode">—</b></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">场景（未解锁不可进入）</div>
+      <div id="scene-list" class="scene-list"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">
+        她记住的事
+        <button id="btn-memory-refresh" class="mini">刷新</button>
+      </div>
+      <div id="memory-list" class="memory-list"></div>
+      <div class="panel-title" style="margin-top:12px">还没结的事</div>
+      <div id="loop-list" class="memory-list"></div>
+    </div>
+
+    <div class="panel danger">
+      <button id="btn-export" class="mini">导出我的数据</button>
+      <button id="btn-wipe" class="mini danger-btn">删除全部记忆</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="title" id="h-scene">加载中…</div>
+        <div class="subtitle" id="h-goal"></div>
+      </div>
+      <div class="topbar-right">
+        <button id="btn-debug" class="mini">调试面板</button>
+      </div>
+    </header>
+
+    <div class="stage">
+      <section class="chat">
+        <div id="messages" class="messages"></div>
+        <div class="composer">
+          <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button id="btn-send">发送</button>
+        </div>
+      </section>
+
+      <aside id="debug" class="debug hidden">
+        <div class="panel-title">本轮决策</div>
+        <div id="debug-body" class="debug-body">还没有对话。</div>
+      </aside>
+    </div>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

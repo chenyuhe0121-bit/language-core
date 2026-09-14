@@ -1,0 +1,244 @@
+"""一轮对话的完整编排。
+
+① 分流   判断这句话是什么，决定走哪条策略
+② 召回   找她该想起什么
+③④ 取场景卡与关系阶段
+⑤ 编译   拼成她眼前的世界
+⑥ 生成
+⑦ 校验   不合格就重生成
+⑧ 写入   异步，不阻塞回复
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import config, persona
+from .checker import check_turn
+from .compiler import CompiledContext, compile_context
+from .llm import build_llm, compress_summary
+from .memory import MemoryStore, MemoryWriter, RecallResult
+from .persona import load_character, load_scene, stage_for_intimacy
+from .segment import Turn, parse
+
+# ---------------------------------------------------------------- ① 分流
+
+INTENT_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("crisis",   ("不想活", "自杀", "结束生命", "活不下去", "伤害自己")),
+    ("refuse",   ("滚", "别烦我", "不想聊这个")),
+    ("comfort",  ("累", "难过", "烦", "压力", "难受", "委屈", "不开心", "失眠", "焦虑", "崩溃")),
+    ("tease",    ("哈哈", "笑死", "你真", "你是不是傻")),
+    ("probe",    ("吗？", "么？", "为什么", "怎么样", "你说呢")),
+    ("invite",   ("我们去", "要不要一起", "陪我去")),
+    ("reminisce", ("上次", "之前", "那次", "以前")),
+]
+
+
+def classify_intent(message: str) -> str:
+    text = (message or "").strip()
+    if not text:
+        return "idle"
+    for name, keys in INTENT_RULES:
+        if any(k in text for k in keys):
+            return name
+    if text.endswith(("?", "？")):
+        return "probe"
+    return "share"
+
+
+# ---------------------------------------------------------------- 结果
+
+
+@dataclass
+class TurnResult:
+    turn: Turn
+    context: CompiledContext
+    checks: dict[str, Any]
+    regenerated: int = 0
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reply": self.turn.to_dict(),
+            "debug": {
+                "params": self.context.params,
+                "budget": self.context.budget.to_dict(),
+                "context": self.context.debug,
+                "checks": self.checks,
+                "regenerated": self.regenerated,
+                "mode": config.MODE,
+                "error": self.error,
+            },
+        }
+
+
+# ---------------------------------------------------------------- 引擎
+
+
+class Engine:
+    def __init__(self, store: MemoryStore | None = None, llm: Any | None = None):
+        self.store = store or MemoryStore()
+        self.llm = llm or build_llm()
+        self.writer = MemoryWriter(self.store)
+        self._turn_counter = 0
+
+    # ---- 关系状态 ----
+
+    def relationship(self, user_id: str, character_id: str) -> dict[str, Any]:
+        profile = self.store.get_profile(user_id, character_id)
+        try:
+            intimacy = int(profile.get("intimacy", "0"))
+        except ValueError:
+            intimacy = 0
+        stage = stage_for_intimacy(intimacy)
+        unlocked = [s.scene_id for s in persona.STAGES if s.intimacy_min <= intimacy]
+        return {
+            "intimacy": intimacy,
+            "stage": stage,
+            "unlocked_scenes": unlocked or ["cafe"],
+            "days_known": int(profile.get("days_known", "0") or 0),
+        }
+
+    def grant_intimacy(self, user_id: str, character_id: str, delta: int) -> int:
+        """亲密度是解锁场景的唯一标准。按完整分钟累计，反复接通不能刷。"""
+        current = self.relationship(user_id, character_id)["intimacy"]
+        new_value = max(0, min(100, current + delta))
+        self.store.set_profile(user_id, character_id, "intimacy", str(new_value))
+        return new_value
+
+    # ---- 主流程 ----
+
+    def respond(self, *, user_id: str, character_id: str, scene_id: str,
+                message: str, allow_regenerate: bool = True) -> TurnResult:
+        char = load_character(character_id)
+        scene = load_scene(scene_id)
+        rel = self.relationship(user_id, character_id)
+        stage = rel["stage"]
+
+        intent = classify_intent(message)
+
+        # 记忆必须赶在召回之前可用。
+        # 用户说「我叫阿哲」，紧接着问「你还记得我叫什么吗」——这两句之间
+        # 如果记忆还在队列里没落库，她就会答「你还没告诉过我」。
+        # 这类事故用户直接判定为「她根本没记住我」，不能接受。
+        # 所以本轮抽取到的记忆采用同步 upsert（本地写，开销极小，且自带去重），
+        # 后台线程只负责兜底整理。
+        extracted = self.writer.extract(message)
+        self._upsert_extracted(user_id, character_id, extracted, scene_id)
+
+        recall = self.store.recall_all(user_id, character_id, message, scene_id)
+
+        # 危机信号优先级最高，盖过所有人格与场景设定
+        extra = ""
+        if intent == "crisis":
+            from .persona import BOUNDARY_POLICY
+            extra = (
+                "# 【最高优先级】用户可能出现危机信号\n"
+                f"{BOUNDARY_POLICY['crisis']['action']}\n"
+                "这一轮不要推进剧情、不要开玩笑、不要追问细节。"
+            )
+
+        ctx = compile_context(
+            char=char, scene=scene, stage=stage, recall=recall,
+            user_message=message, intent=intent, extra_system=extra,
+        )
+
+        turn, checks, regen, error = self._generate_and_check(
+            ctx=ctx, scene=scene, stage=stage, char=char, recall=recall,
+            allow_regenerate=allow_regenerate,
+        )
+
+        # ---- ⑧ 落库与异步写入 ----
+        self.store.add_message(user_id, character_id, "user", message, scene_id)
+        self.store.add_message(user_id, character_id, "assistant", turn.dialogue, scene_id)
+        self.writer.submit(user_id, character_id, message, scene_id, turn.turn_id,
+                           extracted=extracted)
+        self._maybe_compress_summary(user_id, character_id)
+        self.store.mark_open_loops_asked(user_id, character_id)
+
+        return TurnResult(turn=turn, context=ctx, checks=checks,
+                          regenerated=regen, error=error)
+
+    def _generate_and_check(self, *, ctx: CompiledContext, scene, stage, char,
+                            recall: RecallResult, allow_regenerate: bool):
+        error: str | None = None
+        regen = 0
+        checks: dict[str, Any] = {}
+
+        for attempt in range(2 if allow_regenerate else 1):
+            result = self.llm.generate(
+                system=ctx.system,
+                user_message=ctx.user,
+                params=ctx.params,
+                context=ctx.debug,
+                recall=recall,
+                attempt=attempt,
+            )
+            error = result.error
+            if result.error:
+                # 模型不可用时降级到 mock，保证链路不中断
+                from .llm import MockLLM
+                fallback = MockLLM().generate(
+                    system=ctx.system, user_message=ctx.user, params=ctx.params,
+                    context=ctx.debug, recall=recall,
+                )
+                result = fallback
+
+            turn = parse(
+                result.text,
+                character_id=char.id,
+                scene_id=scene.id,
+                stage=stage.id,
+                model=result.model,
+                allowed_expressions=scene.allowed_expressions(),
+                default_expression=scene.default_expression(),
+                local_expressions=scene.exclusive_expressions(),
+                max_chars=None,
+                banned_words=char.raw.get("cannot_do", [])[:0],
+            )
+            checks = check_turn(turn, scene=scene, stage=stage).to_dict()
+
+            if not checks.get("hard_fail"):
+                return turn, checks, regen, error
+
+            regen += 1
+
+        return turn, checks, regen, error
+
+    def _upsert_extracted(self, user_id: str, character_id: str,
+                          extracted: tuple[list[tuple[str, str, float]], list[str]],
+                          scene_id: str) -> None:
+        """把本轮抽取到的记忆同步落库，让它立刻可被召回。
+
+        规则抽取带置信度，add_memory 内部会做去重与低置信拒收，
+        所以重复调用是安全的。
+        """
+        memories, loops = extracted
+        for type_, content, conf in memories:
+            self.store.add_memory(user_id, character_id, type_, content,
+                                  confidence=conf, source_scene=scene_id)
+        for topic in loops:
+            self.store.add_open_loop(user_id, character_id, topic, scene=scene_id)
+
+    def _maybe_compress_summary(self, user_id: str, character_id: str) -> None:
+        """短期记忆滚动压缩。每 SUMMARY_EVERY 条消息触发一次。"""
+        n = self.store.message_count(user_id, character_id)
+        if n == 0 or n % config.SUMMARY_EVERY != 0:
+            return
+        recent = self.store.recent_turns(user_id, character_id, config.SUMMARY_EVERY)
+        dialogue = "\n".join(
+            f"{'用户' if t.role == 'user' else '她'}：{t.content}" for t in recent
+        )
+        old = self.store.get_summary(user_id, character_id)
+        new_summary = compress_summary(self.llm, old, dialogue)
+        if new_summary:
+            self.store.set_summary(user_id, character_id, new_summary)
+
+    def shutdown(self) -> None:
+        """停止后台写入线程并关闭数据库连接。
+
+        只停线程不关连接会在 Windows 上留下文件锁，测试结束删库会失败。
+        """
+        self.writer.shutdown()
+        self.store.close()

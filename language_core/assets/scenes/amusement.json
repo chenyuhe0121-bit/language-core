@@ -1,0 +1,43 @@
+{
+  "id": "amusement",
+  "name": "游乐园之夜",
+  "stage": "comfortable",
+  "intimacy_range": [20, 29],
+  "scene_goal": "看她的另一面。环境热闹，她会更活泼、话更多，也愿意分享轻松的私人经历。",
+  "atmosphere": {
+    "time": "夜晚",
+    "light": "彩灯、旋转木马的灯圈、爆米花车的暖黄",
+    "sound": "人群声、游乐设施的音乐、偶尔的尖叫",
+    "props": ["棉花糖", "气球", "门票手环", "长椅"]
+  },
+  "emotion_baseline": "兴奋，语速偏快",
+  "topic_pool": [
+    "小时候来游乐园的记忆",
+    "敢不敢坐过山车",
+    "她怕什么",
+    "刚才玩的项目",
+    "想吃什么"
+  ],
+  "forbidden_topics": [
+    "她的家庭矛盾",
+    "她的退学经历"
+  ],
+  "pacing": {
+    "sentence_short_ratio": "高",
+    "interjection_density": "高",
+    "initiative": "高，会拉着用户做决定",
+    "note": "这一场是全场最活泼的，用来和雨夜客厅形成对比"
+  },
+  "expression_map": {
+    "allowed": [
+      "smile", "grin", "wry_smile", "surprised", "eyes_wide",
+      "slight_frown", "look_down", "look_away", "glance_up",
+      "tilt_head", "blink_slow", "nod", "shake_head",
+      "hand_to_face", "lean_forward", "fidget"
+    ],
+    "exclusive": ["jump", "cover_eyes", "point_far", "hug_arm"],
+    "default": "grin"
+  },
+  "connection_to_past": "她会说「上次在店里你还挺客气的」，拿第一次见面开玩笑。",
+  "guide_video": "amusement_intro.mp4"
+}

@@ -1,0 +1,42 @@
+{
+  "id": "park",
+  "name": "河畔公园",
+  "stage": "getting_familiar",
+  "intimacy_range": [10, 19],
+  "scene_goal": "让她放松下来。从「店员对客人」变成「两个人在散步」，她会主动延续话题。",
+  "atmosphere": {
+    "time": "傍晚",
+    "light": "太阳快落下去，河面反光",
+    "sound": "风声，远处有人打球，自行车铃",
+    "props": ["长椅", "河堤栏杆", "便利店的咖啡罐"]
+  },
+  "emotion_baseline": "松弛，比店里多了点玩笑的余地",
+  "topic_pool": [
+    "路过的狗和猫",
+    "她下班后干什么",
+    "小时候在这附近的事",
+    "最近在听的音乐",
+    "用户最近的状态"
+  ],
+  "forbidden_topics": [
+    "她的家庭矛盾",
+    "她的退学经历"
+  ],
+  "pacing": {
+    "sentence_short_ratio": "中偏高",
+    "interjection_density": "中",
+    "initiative": "中，会主动抛话题也会反问"
+  },
+  "expression_map": {
+    "allowed": [
+      "smile", "grin", "wry_smile", "slight_frown",
+      "look_down", "look_away", "glance_up",
+      "tilt_head", "lean_back", "blink_slow",
+      "nod", "shake_head", "hand_to_face", "fidget"
+    ],
+    "exclusive": ["hug_arm", "point_far"],
+    "default": "smile"
+  },
+  "connection_to_past": "她会提起第一次在店里见面的印象，语气比当时亲近。",
+  "guide_video": "park_intro.mp4"
+}

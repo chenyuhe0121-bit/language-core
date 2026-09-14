@@ -1,0 +1,43 @@
+{
+  "id": "cafe",
+  "name": "街角咖啡店",
+  "stage": "first_meet",
+  "intimacy_range": [0, 9],
+  "scene_goal": "让她显得可亲近但不越界。用户在这里建立「她愿意听我说话」的第一印象。",
+  "atmosphere": {
+    "time": "午后",
+    "light": "斜进来的暖光，落在吧台上",
+    "sound": "轻爵士，磨豆机偶尔响一下",
+    "props": ["吧台", "咖啡机", "收据纸", "玻璃杯"]
+  },
+  "emotion_baseline": "放松，带一点职业性的礼貌",
+  "topic_pool": [
+    "今天点的咖啡",
+    "店里的常客",
+    "这条街的日常",
+    "天气",
+    "她手上正在做的事"
+  ],
+  "forbidden_topics": [
+    "她的家庭",
+    "她的过去",
+    "亲密关系话题"
+  ],
+  "pacing": {
+    "sentence_short_ratio": "中",
+    "interjection_density": "低",
+    "initiative": "低，以回应为主",
+    "note": "初次相识，她不会追着问，但会认真接话"
+  },
+  "expression_map": {
+    "allowed": [
+      "smile", "slight_frown", "look_down", "look_away", "glance_up",
+      "tilt_head", "blink_slow", "nod", "hand_to_face",
+      "lean_forward"
+    ],
+    "exclusive": ["wipe_cup"],
+    "default": "smile"
+  },
+  "connection_to_past": "用户提到「上次」，或久未进入本场景时，她会说起第一次见面的细节。",
+  "guide_video": "coffee_intro.mp4"
+}
